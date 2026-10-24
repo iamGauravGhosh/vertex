@@ -1,0 +1,28 @@
+name: Zig checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+      - name: Check formatting
+        run: zig fmt --check build.zig build.zig.zon src tests
+      - name: Test Debug
+        run: zig build test
+      - name: Test ReleaseSafe
+        run: zig build test -Doptimize=ReleaseSafe
+      - name: Install executable and Vertex license
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Check the installed CLI
+        run: python3 tests/cli_smoke.py zig-out/bin/vertex

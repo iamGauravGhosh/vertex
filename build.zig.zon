@@ -12,5 +12,6 @@
         "docs",
         "tests",
         "README.md",
+        "LICENSE",
     },
 }

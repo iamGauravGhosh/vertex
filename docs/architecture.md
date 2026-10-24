@@ -1,16 +1,19 @@
 # Architecture
 
-Vertex is a terminal emulator written in Zig. This initial scaffold only prints
-a startup message; windowing, rendering, and shell integration are future work.
+Vertex is a terminal emulator written in Zig. The VT parser, optional control
+string streaming, and stdin trace CLI are implemented. Screen state, image
+decoding, windowing, rendering, and shell integration are future work.
 
 ## Responsibilities
 
-- `src/main.zig`: application entry point; eventually wire up the event loop.
-- `src/terminal/`: terminal state, screen buffer, cursor, scrollback, and parser.
+- `src/main.zig`: process arguments and standard I/O; eventually the event loop.
+- `src/cli.zig`: `vertex parse` and command-line help.
+- `src/terminal/`: allocation-free parsing and event tracing today; terminal state,
+  screen buffer, cursor, and scrollback in future milestones.
 - `src/renderer/`: translate terminal state into drawn glyphs and a cursor.
 - `src/platform/`: OS integration, window events, PTY, and shell lifecycle.
 - `assets/fonts/`: font assets, once selected and licensed for redistribution.
-- `tests/`: future integration tests and fixtures.
+- `tests/`: public-module consumer and executable smoke checks.
 
 ## Intended data flow
 
@@ -22,10 +25,35 @@ Shell output -> PTY -> terminal parser -> screen state -> renderer
 Keep the terminal model independent of the rendering backend and OS APIs so its
 behavior can be tested without opening a window or launching a shell.
 
+The parser is exported as the `vertex_terminal` Zig module. It accepts byte
+chunks and emits syntax events; it does not set terminal modes, perform screen
+updates, write responses, or access the clipboard. A future terminal model will
+consume these events and decide which commands to execute. See
+[the parser guide](vt-parser.md) for the interface and input limits.
+
+## Image extension boundary
+
+APC, OSC, and DCS payload events provide transport for future Kitty, iTerm2, and
+Sixel handlers. APC/OSC streaming is opt-in; DCS always streams after its header.
+Large payloads need no whole-message buffer in the parser.
+
+Image support will follow this path:
+
+```text
+Parser events -> protocol handler -> decoder -> image store/placements -> renderer
+```
+
+Handlers will recognize protocol headers, assemble transfers, decode base64,
+apply budgets, and generate replies. Decoders will produce validated pixels;
+the image store will own their memory and placement relative to terminal cells.
+The renderer will upload and draw those pixels. No backend or decoder interface
+is fixed before those components exist. A consumer must discard provisional
+data when a transfer is interrupted, cancelled, or ends before completion.
+
 ## First milestones
 
 1. Choose the first supported OS, windowing library, and rendering backend.
 2. Open a window and draw a fixed grid of text.
 3. Start a shell through a PTY and read its output.
-4. Add screen state and basic escape-sequence handling.
+4. Add screen state and connect it to the implemented parser's events.
 5. Connect keyboard input and propagate window-size changes to the PTY.
