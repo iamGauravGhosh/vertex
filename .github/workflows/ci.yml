@@ -1,4 +1,4 @@
-name: Zig checks
+name: Zig CI and releases
 
 on:
   push:
@@ -9,10 +9,38 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      release_tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Identify release tags
+        id: version
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          number = r"(?:0|[1-9][0-9]*)"
+          identifier = rf"(?:{number}|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+          tag = os.environ["GITHUB_REF_NAME"]
+          match = re.fullmatch(
+              rf"v{number}\.{number}\.{number}"
+              rf"(?:-(?P<prerelease>{identifier}(?:\.{identifier})*))?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+              tag,
+          )
+          if match:
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write(f"tag={tag}\n")
+                  output.write(f"prerelease={str(match.group('prerelease') is not None).lower()}\n")
+          else:
+              print(f"Tag {tag!r} is not a release version; running checks only.")
+          PY
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
@@ -23,12 +51,69 @@ jobs:
       - name: Test Debug
         run: zig build test
       - name: Test ReleaseSafe
-        run: zig build test -Doptimize=ReleaseSafe
+        run: zig build test -Doptimize=ReleaseSafe -Dcpu=baseline
       - name: Install executable and Vertex license
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
       - name: Check the installed CLI
         run: python3 tests/cli_smoke.py zig-out/bin/vertex
       - name: Check native Wayland windows with headless Weston
         run: python3 tests/wayland_smoke.py zig-out/bin/vertex
       - name: Check dependency-free parser-only build
         run: zig build test -Dgui=false && zig build -Dgui=false --prefix zig-out/headless
+      - name: Package release download
+        if: steps.version.outputs.tag != ''
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          package="vertex-${RELEASE_TAG}-linux-x86_64"
+          mkdir -p "dist/$package"
+          install -m 755 zig-out/bin/vertex "dist/$package/vertex"
+          install -m 644 README.md zig-out/share/licenses/vertex/LICENSE "dist/$package/"
+          tar -C dist -czf "dist/$package.tar.gz" "$package"
+          cd dist
+          sha256sum "$package.tar.gz" > "$package.tar.gz.sha256"
+      - name: Upload release files
+        id: upload
+        if: steps.version.outputs.tag != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vertex-linux-x86_64-${{ github.run_attempt }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.test.outputs.release_tag != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Download tested release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.test.outputs.artifact_id }}
+          merge-multiple: true
+          path: dist
+      - name: Publish GitHub Release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.test.outputs.release_tag }}
+          PRERELEASE: ${{ needs.test.outputs.prerelease }}
+        run: |
+          package="vertex-${RELEASE_TAG}-linux-x86_64"
+          sha256sum --check "$package.tar.gz.sha256"
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            printf '::error::Release %s already exists; its assets were not changed.\n' "$RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" "$package.tar.gz" "$package.tar.gz.sha256" \
+            --verify-tag --generate-notes --title "$RELEASE_TAG" --prerelease="$PRERELEASE"

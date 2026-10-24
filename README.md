@@ -45,6 +45,44 @@ and `fonts-dejavu-core`. On Arch Linux, use `wayland`, `wayland-protocols`,
 
 The public terminal module and `-Dgui=false` executable remain dependency-free.
 
+## Releases
+
+CI runs on branch pushes, pull requests, and all pushed tags. Pushing a version
+tag such as `v0.1.0` publishes a GitHub Release with generated notes after all
+checks pass. Tags use `vMAJOR.MINOR.PATCH`, with optional SemVer prerelease and
+build suffixes. A tag such as `v0.1.0-rc.1` creates a prerelease; unrelated or
+malformed tags run checks without publishing.
+
+To release a committed revision containing the release workflow:
+
+```sh
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin v0.1.0
+```
+
+Creating a local tag alone does not trigger CI. An existing GitHub Release is
+never overwritten; publish a new version tag for subsequent releases. No extra
+repository secrets are needed.
+
+Each release includes `vertex-<tag>-linux-x86_64.tar.gz` and its `.sha256` checksum.
+The archive contains `vertex`, `README.md`, and `LICENSE` in a matching directory.
+The executable is built with Zig 0.17.0 in ReleaseSafe mode for a baseline x86_64
+CPU on Ubuntu 24.04. It needs a compatible Linux/glibc system, a Wayland compositor,
+Wayland client libraries, xkbcommon, FreeType, Fontconfig, and a monospace font.
+On Ubuntu 24.04, install the runtime dependencies with:
+
+```sh
+sudo apt-get install libwayland-client0 libxkbcommon0 libfreetype6 libfontconfig1 fonts-dejavu-core
+```
+
+After downloading both release files into the same directory:
+
+```sh
+sha256sum --check vertex-v0.1.0-linux-x86_64.tar.gz.sha256
+tar -xzf vertex-v0.1.0-linux-x86_64.tar.gz
+./vertex-v0.1.0-linux-x86_64/vertex
+```
+
 ## Commands
 
 ```sh
