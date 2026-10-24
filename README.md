@@ -1,8 +1,25 @@
 # Vertex
 
-A terminal emulator project written in Zig, currently at the initial scaffold
-stage. Running it prints a startup message. The terminal, renderer, and platform
-modules are placeholders for future implementation.
+Vertex is a terminal emulator project written in Zig, with Linux as its primary
+platform and Wayland as its main focus. It aims to deliver a highly customizable,
+fast, and responsive terminal experience, with particular attention to Hyprland
+and Niri users.
+
+The project is currently at the initial scaffold stage. Running it prints a
+startup message. The terminal, renderer, and platform modules are placeholders
+for future implementation; the goals below are not implemented yet.
+
+## Development goals
+
+- **Linux and Wayland first:** Build a smooth terminal experience on Wayland,
+  with particular attention to integration and usability on Hyprland and Niri.
+- **Broader platform support:** Make Vertex available on other POSIX-based
+  operating systems, including macOS, while keeping Linux the primary focus.
+- **Extensive customization:** Give users control over appearance, keybindings,
+  and terminal behavior so Vertex can adapt to their workflows.
+- **Speed and responsiveness:** Aim for fast startup, high throughput, and
+  minimal input and rendering latency, keeping interaction smooth even under
+  heavy terminal output.
 
 ## Requirements
 
