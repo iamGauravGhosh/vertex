@@ -2,7 +2,9 @@
 
 The parser converts byte streams into syntax events. It needs neither an
 allocator nor a terminal window. Command execution, terminal state, replies,
-image decoding, and rendering belong to consumers.
+image decoding, and rendering belong to consumers. The provided
+[`Screen` consumer](screen.md) applies supported commands to a fixed-size grid;
+the parser retains the syntax-only interface described here.
 
 ## Implementation basis
 

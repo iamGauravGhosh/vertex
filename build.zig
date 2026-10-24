@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_consumer_tests = b.addRunArtifact(consumer_tests);
-    const test_step = b.step("test", "Run parser, CLI, and module-consumer tests");
+    const test_step = b.step("test", "Run parser, screen, CLI, and module-consumer tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_consumer_tests.step);
 }

@@ -5,12 +5,15 @@ platform and Wayland as its main focus. It aims to deliver a highly customizable
 fast, and responsive terminal experience, with particular attention to Hyprland
 and Niri users.
 
-The project now includes a reusable VT parser and a command-line event tracer.
+The project includes a reusable VT parser, a terminal screen model, and a
+command-line event tracer.
 The parser handles incremental UTF-8 text and ESC, CSI, OSC, DCS, and opt-in APC
 sequences without allocating memory. OSC/APC streaming hooks allow future image
-protocol consumers to process large transfers. Screen state, image decoding,
-windowing, rendering, and shell/PTY integration are still future work. Running
-without arguments prints the original startup message.
+protocol consumers to process large transfers. The fixed-size screen model
+applies text, ANSI 16/256/RGB colors and attributes, cursor movement, editing,
+and scrolling regions to a grid of cells. Image decoding, windowing, rendering,
+and shell/PTY integration are still future work. Running without arguments
+prints the original startup message.
 
 ## Development goals
 
@@ -33,7 +36,7 @@ without arguments prints the original startup message.
 ## Commands
 
 ```sh
-zig test src/main.zig       # Run parser and CLI unit tests directly
+zig test src/main.zig       # Run parser, screen, and CLI unit tests directly
 zig fmt --check build.zig src tests
 ```
 
@@ -61,9 +64,13 @@ PRINT U+0048 "H"
 ```
 
 The trace escapes payload bytes and never sends incoming escape sequences to
-your terminal. It parses commands; it does not apply colors or draw a screen.
+your terminal. This command parses events; the reusable screen model applies
+them to cells without drawing a window.
 See the [parser API and integration guide](docs/vt-parser.md) for a Zig consumer,
-event lifetimes, recovery behavior, and limits.
+event lifetimes, recovery behavior, and limits. The [screen model guide](docs/screen.md)
+shows parser-to-screen integration and supported controls. The initial screen
+uses fixed dimensions and one Unicode scalar per cell, without scrollback or
+an alternate screen.
 
 ## Structure
 
@@ -75,10 +82,12 @@ vertex/
 │   ├── main.zig           # Application entry point
 │   ├── cli.zig            # Stdin event-trace command
 │   ├── terminal/
-│   │   ├── root.zig       # Public parser API
+│   │   ├── root.zig       # Public parser and screen APIs
 │   │   ├── Parser.zig     # Incremental VT and UTF-8 state machine
+│   │   ├── Screen.zig     # Grid, styles, cursor, editing, and scrolling
 │   │   ├── trace.zig      # Escaped event formatting
-│   │   └── parser_tests.zig
+│   │   ├── parser_tests.zig
+│   │   └── screen_tests.zig
 │   ├── renderer/
 │   │   └── root.zig       # Text and cursor rendering
 │   └── platform/
@@ -87,7 +96,8 @@ vertex/
 │   └── fonts/             # Future font assets
 ├── docs/
 │   ├── architecture.md    # Responsibilities and milestones
-│   └── vt-parser.md       # Parser API and behavior
+│   ├── vt-parser.md       # Parser API and behavior
+│   └── screen.md          # Screen API and supported controls
 ├── tests/                 # Module-consumer and executable smoke checks
 ├── LICENSE                # Vertex's MIT license
 └── .gitignore

@@ -2,6 +2,24 @@
 const std = @import("std");
 const vt = @import("vertex_terminal");
 
+test "a public screen consumer applies colors cursor movement and scrolling" {
+    var screen = try vt.Screen.init(std.testing.allocator, 2, 4);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("\x1b[31mABCD\r\n\x1b[38;2;1;2;3mEFGH", &screen);
+    parser.feed("\x1b[S\x1b[2;3HX", &screen);
+    for (parser.finish()) |item| if (item) |event| screen.handle(event);
+    const cell: vt.Cell = screen.getCell(0, 0).?;
+    const style: vt.Style = cell.style;
+    const color: vt.Color = .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } };
+    const cursor: vt.Cursor = screen.getCursor();
+    try std.testing.expectEqual(@as(u21, 'E'), cell.codepoint);
+    try std.testing.expectEqualDeep(color, style.foreground);
+    try std.testing.expectEqual(@as(u21, 'X'), screen.getRow(1).?[2].codepoint);
+    try std.testing.expectEqual(@as(usize, 1), cursor.row);
+    try std.testing.expectEqual(@as(usize, 3), cursor.column);
+}
+
 const Consumer = struct {
     characters: [8]u21 = undefined,
     characters_len: usize = 0,
