@@ -36,13 +36,17 @@ test "CLI escapes OSC data, traces DCS and preserves missing subparameters" {
     for (output.buffered()) |byte| try testing.expect(byte == '\n' or (byte >= 0x20 and byte <= 0x7e));
 }
 
-test "CLI keeps default startup behavior" {
+test "CLI selects the window without consuming streams" {
     var input = std.Io.Reader.fixed("");
     var output = std.Io.Writer.fixed(&.{});
     var diagnostic_bytes: [256]u8 = undefined;
     var diagnostic = std.Io.Writer.fixed(&diagnostic_bytes);
-    try testing.expectEqual(@as(u8, 0), try cli.run(&.{}, &input, &output, &diagnostic));
-    try testing.expectEqualStrings("Vertex: terminal emulator project initialized.\n", diagnostic.buffered());
+    try testing.expectError(error.WindowRequired, cli.run(&.{}, &input, &output, &diagnostic));
+    try testing.expectEqualStrings("", diagnostic.buffered());
+    try testing.expect(cli.opensWindow(&.{}));
+    try testing.expect(cli.opensWindow(&.{ "--", "/bin/sh", "-c", "exit 0" }));
+    try testing.expect(!cli.opensWindow(&.{"--"}));
+    try testing.expect(!cli.opensWindow(&.{"parse"}));
 }
 
 test "CLI help and invalid arguments do not consume stdin" {

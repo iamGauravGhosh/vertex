@@ -1,2 +1,5 @@
-//! Platform integration: window events, PTYs, shell processes, and resizing.
-//! TODO: Implement the first target platform and connect its PTY to the terminal.
+//! Linux GUI is optional; the parser and CLI never require a display.
+pub const run = if (@import("build_options").gui)
+    @import("linux.zig").run
+else
+    @import("disabled.zig").run;

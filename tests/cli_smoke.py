@@ -24,21 +24,30 @@ def invoke(*args, data=b""):
 
 class CliSmoke(unittest.TestCase):
     def test_default_help_and_invalid_arguments(self):
-        result = invoke()
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, b"")
-        self.assertEqual(
-            result.stderr, b"Vertex: terminal emulator project initialized.\n"
-        )
         for args in [("--help",), ("-h",), ("parse", "--help")]:
             result = invoke(*args)
             self.assertEqual(result.returncode, 0)
             self.assertIn(b"Usage: vertex", result.stdout)
             self.assertEqual(result.stderr, b"")
-        for args in [("unknown",), ("parse", "extra")]:
+        for args in [("unknown",), ("parse", "extra"), ("--",)]:
             result = invoke(*args)
             self.assertEqual(result.returncode, 2)
             self.assertIn(b"invalid arguments", result.stderr)
+
+    def test_window_launch_reports_a_missing_display_without_reading_stdin(self):
+        environment = os.environ.copy()
+        environment.pop("WAYLAND_SOCKET", None)
+        environment["WAYLAND_DISPLAY"] = "/vertex/no-such-wayland-display"
+        result = subprocess.run(
+            [str(EXECUTABLE)], input=b"", capture_output=True,
+            env=environment, timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b"")
+        self.assertTrue(
+            b"Wayland" in result.stderr or b"GuiDisabled" in result.stderr,
+            result.stderr,
+        )
 
     def test_piped_colors_unicode_and_controls(self):
         result = invoke("parse", data="\x1b[31mAé\x1b[0m\n".encode())

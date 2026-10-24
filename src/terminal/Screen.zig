@@ -1,5 +1,5 @@
-//! Fixed-size terminal state. Feed Parser events through handle(); no parser,
-//! I/O, renderer, or allocations are involved after initialization.
+//! Owned terminal state. Feed Parser events through handle(); only init and
+//! resize allocate. No parser, I/O, or renderer is involved.
 const std = @import("std");
 const Parser = @import("Parser.zig");
 const Screen = @This();
@@ -77,6 +77,30 @@ pub fn deinit(self: *Screen) void {
     self.* = undefined;
 }
 
+/// Preserve the top-left overlap without reflow. A size change invalidates
+/// borrowed rows. Failure leaves every field and the old storage unchanged.
+pub fn resize(self: *Screen, rows: usize, columns: usize) !void {
+    if (rows == 0 or columns == 0) return error.InvalidDimensions;
+    if (rows == self.rows and columns == self.columns) return;
+    var replacement = try init(self.allocator, rows, columns);
+    const width = @min(columns, self.columns);
+    for (0..@min(rows, self.rows)) |row| {
+        @memcpy(replacement.cells[row * columns ..][0..width], self.cells[row * self.columns ..][0..width]);
+    }
+    self.allocator.free(self.cells);
+    self.cells = replacement.cells;
+    self.rows = rows;
+    self.columns = columns;
+    self.cursor.row = @min(self.cursor.row, rows - 1);
+    self.cursor.column = @min(self.cursor.column, columns - 1);
+    self.saved.row = @min(self.saved.row, rows - 1);
+    self.saved.column = @min(self.saved.column, columns - 1);
+    self.scroll_top = 0;
+    self.scroll_bottom = rows;
+    self.wrap_pending = false;
+    self.saved.wrap_pending = false;
+}
+
 /// Reset screen state only. Reset the separate Parser as well to abandon input.
 pub fn reset(self: *Screen) void {
     @memset(self.cells, .{});
@@ -96,7 +120,7 @@ pub fn getCell(self: *const Screen, row: usize, column: usize) ?Cell {
     return self.cells[row * self.columns + column];
 }
 
-/// The borrowed row remains valid until deinit; later events update its cells.
+/// Borrowed rows remain valid until resize/deinit; events update their cells.
 pub fn getRow(self: *const Screen, row: usize) ?[]const Cell {
     if (row >= self.rows) return null;
     return self.cells[row * self.columns ..][0..self.columns];

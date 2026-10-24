@@ -5,15 +5,17 @@ platform and Wayland as its main focus. It aims to deliver a highly customizable
 fast, and responsive terminal experience, with particular attention to Hyprland
 and Niri users.
 
-The project includes a reusable VT parser, a terminal screen model, and a
+The Linux MVP opens a native Wayland window, starts your interactive shell through
+a PTY, and renders its output with a CPU text renderer. Keyboard input, colors,
+a cursor, window resizing, and integer display scaling are supported.
+
+The project also includes a reusable VT parser, a terminal screen model, and a
 command-line event tracer.
 The parser handles incremental UTF-8 text and ESC, CSI, OSC, DCS, and opt-in APC
 sequences without allocating memory. OSC/APC streaming hooks allow future image
-protocol consumers to process large transfers. The fixed-size screen model
+protocol consumers to process large transfers. The resizable screen model
 applies text, ANSI 16/256/RGB colors and attributes, cursor movement, editing,
-and scrolling regions to a grid of cells. Image decoding, windowing, rendering,
-and shell/PTY integration are still future work. Running without arguments
-prints the original startup message.
+and scrolling regions to a grid of cells. Image decoding remains future work.
 
 ## Development goals
 
@@ -29,9 +31,19 @@ prints the original startup message.
 
 ## Requirements
 
-- Zig 0.17.0 (the toolchain used to create this scaffold).
-- No external dependencies.
-- Python 3 for the executable smoke checks in CI.
+- Zig 0.17.0.
+- Linux with a Wayland compositor for the GUI.
+- `pkg-config`, `wayland-scanner`, `wayland-protocols`, and development libraries
+  for Wayland, xkbcommon, FreeType, Fontconfig, and libc/PTYs.
+- An installed monospace font, resolved through Fontconfig.
+- Python 3 and Weston for executable/window smoke checks in CI.
+
+On Debian/Ubuntu, GUI development dependencies are `libwayland-dev`,
+`wayland-protocols`, `libxkbcommon-dev`, `libfreetype-dev`, `libfontconfig1-dev`,
+and `fonts-dejavu-core`. On Arch Linux, use `wayland`, `wayland-protocols`,
+`libxkbcommon`, `freetype2`, `fontconfig`, and a monospace font.
+
+The public terminal module and `-Dgui=false` executable remain dependency-free.
 
 ## Commands
 
@@ -44,11 +56,25 @@ Build commands (reserved for CI by the inherited repository instructions):
 
 ```sh
 zig build                  # Install the executable and Vertex's license
-zig build test             # Run unit tests and the public-module consumer test
+zig build test             # Core, public-module, and headless Linux integration tests
+zig build -Dgui=false      # Parser-only executable, without GUI dependencies
 python3 tests/cli_smoke.py zig-out/bin/vertex
+python3 tests/wayland_smoke.py zig-out/bin/vertex  # Private headless Weston instances
 ```
 
-Once built, inspect a stream of terminal output:
+Once built, launch the terminal or run an explicit command:
+
+```sh
+zig-out/bin/vertex
+zig-out/bin/vertex -- /bin/sh -c 'printf "Hello\\n"; exec /bin/sh -i'
+```
+
+The default shell is `$SHELL`, then the account shell, then `/bin/sh`. Vertex
+inherits the working directory and environment and sets `TERM=xterm-256color`
+and `COLORTERM=truecolor`. Exiting the shell closes the window; the shell's exit
+status becomes Vertex's status. A missing Wayland connection fails with a diagnostic.
+
+To inspect a stream of terminal output without opening a window:
 
 ```sh
 printf '\033[31mHello\033[0m\n' | zig-out/bin/vertex parse
@@ -68,9 +94,23 @@ your terminal. This command parses events; the reusable screen model applies
 them to cells without drawing a window.
 See the [parser API and integration guide](docs/vt-parser.md) for a Zig consumer,
 event lifetimes, recovery behavior, and limits. The [screen model guide](docs/screen.md)
-shows parser-to-screen integration and supported controls. The initial screen
-uses fixed dimensions and one Unicode scalar per cell, without scrollback or
-an alternate screen.
+shows parser-to-screen integration and supported controls.
+
+## MVP limits
+
+The terminal targets basic shell work, including command editing, history,
+completion, Ctrl shortcuts, and output scrolling. It starts at 80×24 cells unless
+the compositor assigns another size. Fonts use 16 logical pixels; appearance is
+currently fixed. Resizing preserves the top-left overlap without reflow and
+notifies the PTY. There are no client-side decorations; use compositor shortcuts
+for moving, resizing, and closing the window.
+
+Each Unicode scalar occupies one cell. Wide characters, grapheme layout, IME,
+scrollback history, alternate screens, application cursor/keypad modes, terminal
+query replies, selection/clipboard, mouse reporting, images, and fractional-scale
+protocols remain future work. Missing glyphs use a replacement glyph. Blink is
+rendered steadily. `TERM=xterm-256color` does not imply full xterm compatibility;
+full-screen programs such as Vim and htop are outside this milestone.
 
 ## Structure
 
@@ -91,7 +131,11 @@ vertex/
 │   ├── renderer/
 │   │   └── root.zig       # Text and cursor rendering
 │   └── platform/
-│       └── root.zig       # OS, window events, PTY, and shell integration
+│       ├── root.zig       # Optional Linux GUI entry
+│       ├── linux.zig      # Wayland, keyboard, buffers, and event loop
+│       ├── Pty.zig        # PTY and child-session lifecycle
+│       ├── input.zig      # Terminal key encoding
+│       └── c.h            # Build-time system-header bindings
 ├── assets/
 │   └── fonts/             # Future font assets
 ├── docs/
@@ -103,6 +147,6 @@ vertex/
 └── .gitignore
 ```
 
-See [the architecture notes](docs/architecture.md) for the initial direction.
+See [the architecture notes](docs/architecture.md) for integration details.
 
 Vertex uses the [MIT license](LICENSE). The parser has no external dependencies.

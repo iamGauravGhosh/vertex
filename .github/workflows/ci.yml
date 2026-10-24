@@ -16,6 +16,8 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
+      - name: Install Linux GUI and smoke-test dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev wayland-protocols libxkbcommon-dev libfreetype-dev libfontconfig1-dev fonts-dejavu-core weston
       - name: Check formatting
         run: zig fmt --check build.zig build.zig.zon src tests
       - name: Test Debug
@@ -26,3 +28,7 @@ jobs:
         run: zig build -Doptimize=ReleaseSafe
       - name: Check the installed CLI
         run: python3 tests/cli_smoke.py zig-out/bin/vertex
+      - name: Check native Wayland windows with headless Weston
+        run: python3 tests/wayland_smoke.py zig-out/bin/vertex
+      - name: Check dependency-free parser-only build
+        run: zig build test -Dgui=false && zig build -Dgui=false --prefix zig-out/headless

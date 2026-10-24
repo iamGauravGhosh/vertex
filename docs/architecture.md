@@ -1,26 +1,30 @@
 # Architecture
 
-Vertex is a terminal emulator written in Zig. The VT parser, optional control
-string streaming, fixed-size screen model, and stdin trace CLI are implemented.
-Image decoding, windowing, rendering, and shell integration are future work.
+Vertex is a terminal emulator written in Zig. The Linux MVP connects a native
+Wayland window, CPU renderer, and interactive shell PTY to the reusable VT parser
+and resizable screen model. A separate stdin trace CLI remains available.
 
 ## Responsibilities
 
-- `src/main.zig`: process arguments and standard I/O; eventually the event loop.
-- `src/cli.zig`: `vertex parse` and command-line help.
+- `src/main.zig`: select a window session or headless CLI and report errors.
+- `src/cli.zig`: window-launch selection, `vertex parse`, and command-line help.
 - `src/terminal/`: allocation-free parsing and event tracing, plus an owned screen
   grid with colors, attributes, cursor state, editing, and scrolling regions.
-  Scrollback, resizing, and alternate screens remain future milestones.
-- `src/renderer/`: translate terminal state into drawn glyphs and a cursor.
-- `src/platform/`: OS integration, window events, PTY, and shell lifecycle.
-- `assets/fonts/`: font assets, once selected and licensed for redistribution.
+  Resizing preserves the top-left overlap without reflow. Scrollback and alternate
+  screens remain future milestones.
+- `src/renderer/`: Fontconfig font selection, bounded FreeType glyph cache, and
+  cell/style/cursor drawing into XRGB8888 memory.
+- `src/platform/`: native Wayland globals, xdg-shell, shared-memory buffers,
+  xkbcommon keyboard state, timer-based repeat, PTY, and child lifecycle.
+- `assets/fonts/`: reserved for future bundled fonts; the MVP uses system fonts.
 - `tests/`: public-module consumer and executable smoke checks.
 
-## Intended data flow
+## Data flow
 
 ```text
 Keyboard input -> PTY -> shell
 Shell output -> PTY -> terminal parser -> screen state -> renderer
+Wayland configure -> screen.resize -> TIOCSWINSZ -> shell SIGWINCH
 ```
 
 Keep the terminal model independent of the rendering backend and OS APIs so its
@@ -30,8 +34,8 @@ The parser and screen model are exported as the `vertex_terminal` Zig module.
 The parser accepts byte chunks and emits syntax events; it does not set terminal
 modes, perform screen updates, write responses, or access the clipboard.
 `Screen.handle` consumes those events and applies supported text, style, cursor,
-and scrolling commands. The screen allocates its grid once and processes events
-without further allocation. See [the parser guide](vt-parser.md) for syntax and
+and scrolling commands. The screen allocates at initialization and resize and
+processes events without allocation. See [the parser guide](vt-parser.md) for syntax and
 [the screen guide](screen.md) for command execution and ownership.
 
 ## Image extension boundary
@@ -53,10 +57,30 @@ The renderer will upload and draw those pixels. No backend or decoder interface
 is fixed before those components exist. A consumer must discard provisional
 data when a transfer is interrupted, cancelled, or ends before completion.
 
-## First milestones
+## Linux integration
 
-1. Choose the first supported OS, windowing library, and rendering backend.
-2. Open a window and draw a fixed grid of text.
-3. Start a shell through a PTY and read its output.
-4. Connect the existing parser and screen model to the renderer and PTY output.
-5. Connect keyboard input and propagate window-size changes to the PTY.
+The executable uses system libraries through build-time translated headers.
+`wayland-scanner` generates stable xdg-shell declarations and protocol metadata
+in the build cache. Only generated protocol code is C; application logic is Zig.
+`-Dgui=false` omits the GUI libraries and code generation entirely.
+
+One loop dispatches Wayland events, reads bounded PTY batches, flushes queued
+keyboard bytes, and handles keyboard-repeat timers. It follows Wayland's
+prepare/read/cancel contract and enables writable polling when a flush would
+block. Frames are scheduled only when terminal state or window size changes.
+Two active shared-memory buffers are used; resize retires old buffers until
+the compositor releases them. Output enter/leave and scale events determine the
+integer buffer scale, independently of logical terminal dimensions.
+
+The PTY child receives a new session and controlling terminal, reset signal
+dispositions, inherited working directory, and terminal environment variables.
+A close-on-exec error pipe reports launch failure before entering the event loop.
+The parent reaps child exits even when descendants retain the slave. Closing
+the window hangs up the foreground job and shell session, with bounded waiting
+and forced termination of an unresponsive shell.
+
+Headless tests cover parsing, screen resizing, key encoding, PTY I/O and lifecycle,
+and in-memory rendering. CI also starts private headless Weston instances at
+different geometries/scales. The optional `VERTEX_TEST_WAYLAND=1` integration
+test opens a real window, renders a short command, and checks its exit status.
+Full-screen applications, scrollback, grapheme layout, and images remain future work.

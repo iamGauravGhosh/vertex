@@ -1,6 +1,6 @@
 # Terminal screen model
 
-`vertex_terminal.Screen` applies parser events to a fixed-size, owned grid. It
+`vertex_terminal.Screen` applies parser events to a resizable, owned grid. It
 has no renderer, I/O, PTY, or shell dependencies. The parser remains usable on
 its own, and `vertex parse` continues to print syntax events rather than drawing
 this grid.
@@ -37,6 +37,7 @@ The public API is:
 | --- | --- |
 | `Screen.init(allocator, rows, columns)` | Allocate and initialize a grid |
 | `deinit()` | Free the grid; the value must no longer be used |
+| `resize(rows, columns)` | Preserve top-left overlap, blank new cells, clamp cursors, reset margins; no reflow |
 | `reset()` | Clear cells and restore initial state without reallocating |
 | `handle(event)` | Consume one parser event synchronously |
 | `getCell(row, column)` | Return a cell by value, or null outside the grid |
@@ -45,13 +46,17 @@ The public API is:
 
 Dimensions must be nonzero; overflowing the cell count or byte size returns
 `error.InvalidDimensions`. Allocation failures return `error.OutOfMemory`.
-Event processing allocates nothing. Treat `rows`, `columns`, backing storage,
-and other internal fields as read-only; use events to update state. Do not
+Event processing allocates nothing; resize allocates replacement storage, and a
+failed resize leaves the original grid and all state unchanged. A same-size
+resize does nothing. Resize clears current/saved pending wrap and resets margins
+to the whole screen; other styles and modes remain unchanged. Treat `rows`,
+`columns`, backing storage, and other internal fields as read-only; use events
+and `resize()` to update state. Do not
 duplicate an owning `Screen` or mutate it concurrently.
 
-Accessors and cursor coordinates are zero-based. Borrowed rows live until
-`deinit()`, but subsequent events can change their contents. Cells contain a
-`u21` codepoint and a `Style`. Each decoded scalar occupies one cell, including
+Accessors and cursor coordinates are zero-based. Borrowed rows live until a
+successful size-changing `resize()` or `deinit()`; events can change their
+contents. Cells contain a `u21` codepoint and a `Style`. Each decoded scalar occupies one cell, including
 wide characters and combining marks. Blank cells contain a space. Initialization
 and reset use default colors and no attributes; erasure, editing, and scrolling
 fill spaces using the active style.
@@ -140,8 +145,9 @@ outside SGR are ignored as a whole command. No terminal replies are generated.
 
 ## Limits and validation
 
-This milestone has no resizing, reflow, alternate screen, scrollback, custom tab
-stops, grapheme layout, images, renderer, or shell integration.
+The model has no reflow, alternate screen, scrollback, custom tab stops, grapheme
+layout, or images. The Linux application connects it to a Wayland CPU renderer
+and shell PTY; those dependencies are outside the public terminal module.
 
 `zig test src/main.zig` covers ownership and allocation failure, controls,
 styles, editing, scroll regions, degenerate sizes, split input, and arbitrary

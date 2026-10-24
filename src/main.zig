@@ -10,6 +10,10 @@ pub fn main(init: std.process.Init) u8 {
 
 fn run(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (cli.opensWindow(args[1..])) {
+        const platform = if (@import("builtin").is_test) @import("platform/disabled.zig") else @import("platform/root.zig");
+        return platform.run(init.arena.allocator(), if (args.len > 1) args[2..] else &.{});
+    }
     var input_buffer: [4096]u8 = undefined;
     var output_buffer: [4096]u8 = undefined;
     var diagnostic_buffer: [1024]u8 = undefined;

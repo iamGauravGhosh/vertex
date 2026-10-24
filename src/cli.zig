@@ -3,8 +3,10 @@ const terminal = @import("terminal/root.zig");
 const trace = @import("terminal/trace.zig");
 
 const usage =
-    \\Usage: vertex [parse [--stream-strings] | --help]
+    \\Usage: vertex [parse [--stream-strings] | -- command [args...] | --help]
     \\
+    \\  (no arguments)  Open a Wayland terminal running your interactive shell.
+    \\  -- command      Run a command in the terminal instead of your shell.
     \\  parse       Read VT bytes from stdin and write an escaped event trace.
     \\  --stream-strings  Trace OSC and APC incrementally (after parse).
     \\  --help, -h  Show this help.
@@ -20,10 +22,7 @@ pub fn run(
     output: *std.Io.Writer,
     diagnostic: *std.Io.Writer,
 ) !u8 {
-    if (args.len == 0) {
-        try diagnostic.writeAll("Vertex: terminal emulator project initialized.\n");
-        return 0;
-    }
+    if (opensWindow(args)) return error.WindowRequired;
     if ((args.len == 1 and isHelp(args[0])) or
         (args.len == 2 and std.mem.eql(u8, args[0], "parse") and isHelp(args[1])))
     {
@@ -60,6 +59,11 @@ pub fn run(
         if (maybe_event) |event| try trace.writeEvent(output, event);
     }
     return 0;
+}
+
+/// Keep launch selection independent of windowing and injected stream I/O.
+pub fn opensWindow(args: []const []const u8) bool {
+    return args.len == 0 or (args.len > 1 and std.mem.eql(u8, args[0], "--"));
 }
 
 fn isHelp(arg: []const u8) bool {

@@ -1,4 +1,4 @@
-//! Platform-independent VT parsing and fixed-size terminal screen state.
+//! Platform-independent VT parsing and resizable terminal screen state.
 //! See docs/vt-parser.md and docs/screen.md for the public contracts.
 pub const Parser = @import("Parser.zig");
 pub const Screen = @import("Screen.zig");

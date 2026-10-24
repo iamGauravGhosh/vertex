@@ -18,6 +18,9 @@ test "a public screen consumer applies colors cursor movement and scrolling" {
     try std.testing.expectEqual(@as(u21, 'X'), screen.getRow(1).?[2].codepoint);
     try std.testing.expectEqual(@as(usize, 1), cursor.row);
     try std.testing.expectEqual(@as(usize, 3), cursor.column);
+    try screen.resize(3, 5);
+    try std.testing.expectEqual(@as(u21, 'X'), screen.getRow(1).?[2].codepoint);
+    try std.testing.expectEqualDeep(vt.Cell{}, screen.getCell(2, 4).?);
 }
 
 const Consumer = struct {

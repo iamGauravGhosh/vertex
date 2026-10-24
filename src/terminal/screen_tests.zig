@@ -28,6 +28,43 @@ fn expectCursor(screen: *const vt.Screen, row: usize, column: usize) !void {
     try t.expectEqual(column, cursor.column);
 }
 
+test "resize preserves overlap and styles, blanks growth, and clamps saved state" {
+    var screen = try vt.Screen.init(t.allocator, 3, 4);
+    defer screen.deinit();
+    feed(&screen, "\x1b[31mABCD\r\nEFGH\r\nIJKL\x1b[3;4H\x1b7\x1b[2;3r");
+    try screen.resize(2, 3);
+    try expectRows(&screen, &.{ "ABC", "EFG" });
+    try t.expectEqualDeep(vt.Color{ .indexed = 1 }, screen.getCell(0, 1).?.style.foreground);
+    try t.expectEqual(@as(usize, 0), screen.scroll_top);
+    try t.expectEqual(@as(usize, 2), screen.scroll_bottom);
+    feed(&screen, "\x1b8");
+    try expectCursor(&screen, 1, 2);
+    try t.expect(!screen.wrap_pending);
+    try screen.resize(3, 5);
+    try expectRows(&screen, &.{ "ABC  ", "EFG  ", "     " });
+    try t.expectEqualDeep(vt.Style{}, screen.getCell(2, 4).?.style);
+    try screen.resize(1, 1);
+    try expectCursor(&screen, 0, 0);
+    feed(&screen, "XY\r\nZ");
+    try expectRows(&screen, &.{"Z"});
+}
+
+test "resize validates dimensions and allocation failure preserves the original screen" {
+    var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 1 });
+    var screen = try vt.Screen.init(failing.allocator(), 2, 3);
+    defer screen.deinit();
+    feed(&screen, "abc\r\ndef");
+    const original = screen.cells.ptr;
+    try screen.resize(2, 3);
+    try t.expectError(error.InvalidDimensions, screen.resize(0, 3));
+    try t.expectError(error.InvalidDimensions, screen.resize(std.math.maxInt(usize), 3));
+    try t.expectError(error.OutOfMemory, screen.resize(4, 5));
+    try t.expectEqual(original, screen.cells.ptr);
+    try expectRows(&screen, &.{ "abc", "def" });
+    try expectCursor(&screen, 1, 2);
+    try t.expect(screen.wrap_pending);
+}
+
 test "screen owns a blank fixed grid and checks dimensions and access bounds" {
     var screen = try vt.Screen.init(t.allocator, 2, 3);
     defer screen.deinit();
