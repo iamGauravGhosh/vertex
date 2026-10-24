@@ -1,0 +1,12 @@
+# Zig build output and caches
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Local editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
