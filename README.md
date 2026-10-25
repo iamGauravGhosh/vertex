@@ -9,7 +9,8 @@ The Linux MVP opens a native Wayland window, starts your interactive shell throu
 a PTY, and renders shaped text using OpenGL ES 3 through EGL, with automatic CPU
 fallback. Glyph atlases and row damage tracking avoid repeated rasterization and
 redrawing unchanged text. Keyboard input, colors, a cursor, window resizing, and
-integer display scaling are supported.
+integer display scaling, Unicode graphemes, mouse reporting, bracketed paste,
+and negotiated modern keyboard input are supported.
 
 The project also includes a reusable VT parser, a terminal screen model, and a
 command-line event tracer.
@@ -37,16 +38,16 @@ and scrolling regions to a grid of cells. Image decoding remains future work.
 - Linux with a Wayland compositor for the GUI.
 - `pkg-config`, `wayland-scanner`, `wayland-protocols`, and development libraries
   for Wayland/wayland-egl, xkbcommon, FreeType, Fontconfig, HarfBuzz, EGL,
-  OpenGL ES 3, and libc/PTYs.
+  OpenGL ES 3, FriBidi, and libc/PTYs.
 - An installed monospace font, resolved through Fontconfig.
 - Python 3 and Weston for executable/window smoke checks in CI.
 
 On Debian/Ubuntu, GUI development dependencies are `libwayland-dev`,
 `wayland-protocols`, `libxkbcommon-dev`, `libfreetype-dev`, `libfontconfig1-dev`,
-`libharfbuzz-dev`, `libegl1-mesa-dev`, `libgles2-mesa-dev`,
+`libharfbuzz-dev`, `libfribidi-dev`, `libegl1-mesa-dev`, `libgles2-mesa-dev`,
 `libwayland-egl-backend-dev`, and `fonts-dejavu-core`. For software GPU tests,
 install `libgl1-mesa-dri`. On Arch Linux, use `wayland`, `wayland-protocols`,
-`libxkbcommon`, `freetype2`, `fontconfig`, `harfbuzz`, `libglvnd`, `mesa`, and a
+`libxkbcommon`, `freetype2`, `fontconfig`, `harfbuzz`, `fribidi`, `libglvnd`, `mesa`, and a
 monospace font.
 
 The public terminal module and `-Dgui=false` executable remain dependency-free.
@@ -74,13 +75,13 @@ Each release includes `vertex-<tag>-linux-x86_64.tar.gz` and its `.sha256` check
 The archive contains `vertex`, `README.md`, and `LICENSE` in a matching directory.
 The executable is built with Zig 0.17.0 in ReleaseSafe mode for a baseline x86_64
 CPU on Ubuntu 24.04. It needs a compatible Linux/glibc system, a Wayland compositor,
-Wayland client/EGL libraries, xkbcommon, FreeType, Fontconfig, HarfBuzz, EGL,
+Wayland client/EGL libraries, xkbcommon, FreeType, Fontconfig, HarfBuzz, FriBidi, EGL,
 OpenGL ES libraries, and a monospace font. EGL/GLES libraries are required even
 when selecting CPU rendering; an available GPU driver is optional in auto mode.
 On Ubuntu 24.04, install the runtime dependencies with:
 
 ```sh
-sudo apt-get install libwayland-client0 libwayland-egl1 libxkbcommon0 libfreetype6 libfontconfig1 libharfbuzz0b libegl1 libgles2 libgl1-mesa-dri fonts-dejavu-core
+sudo apt-get install libwayland-client0 libwayland-egl1 libxkbcommon0 libfreetype6 libfontconfig1 libharfbuzz0b libfribidi0 libegl1 libgles2 libgl1-mesa-dri fonts-dejavu-core
 ```
 
 After downloading both release files into the same directory:
@@ -156,15 +157,41 @@ currently fixed. Resizing preserves the top-left overlap without reflow and
 notifies the PTY. There are no client-side decorations; use compositor shortcuts
 for moving, resizing, and closing the window.
 
-HarfBuzz shapes left-to-right runs and enables standard ligatures and contextual
-substitutions when the chosen font supports them. Each Unicode scalar still
-occupies one cell; ligatures retain the source cell span and cursor positions.
-Wide characters, grapheme layout, bidirectional layout, font fallback, color emoji, IME,
-scrollback history, alternate screens, application cursor/keypad modes, terminal
-query replies, selection/clipboard, mouse reporting, images, and fractional-scale
-protocols remain future work. Missing glyphs use a replacement glyph. Blink is
-rendered steadily. `TERM=xterm-256color` does not imply full xterm compatibility;
-full-screen programs such as Vim and htop are outside this milestone.
+Unicode 15.1 extended graphemes retain combining marks and emoji sequences in
+one cluster. Wide and emoji clusters occupy two columns; ambiguous characters
+occupy one. Fontconfig supplies fallback faces. FreeType color bitmaps and
+COLRv0 glyphs render in color in both backends; unsupported color-font formats
+use monochrome/replacement fallback. Missing system fonts can still limit coverage.
+
+Bidirectional rendering is opt-in: set `VERTEX_BIDI=auto` to resolve paragraphs
+across soft wraps, or `VERTEX_BIDI=off` (the default) for fixed visual columns.
+Wayland text-input-v3 supplies IME composition and a temporary preedit overlay.
+Without that protocol, XKB dead-key/Compose input remains available. The PTY
+application owns surrounding editable text, so IME surrounding-text deletion is
+not advertised.
+
+## Input and terminal protocols
+
+- Mouse tracking supports X10 (9), normal (1000), button-motion (1002), and
+  all-motion (1003), with legacy, SGR (1006), and SGR pixel (1016) encoding.
+  Mode 1004 reports keyboard focus changes. Shift bypasses mouse reporting.
+- Ctrl+Shift+V pastes the Wayland clipboard. Shift+Insert and middle-click
+  paste primary selection when the compositor supports it. Middle-click goes
+  to the application while mouse reporting is enabled; Shift overrides it.
+- Mode 2004 wraps paste in bracketed-paste delimiters. Transfers are asynchronous,
+  capped at 8 MiB, and queued only after successful receipt. Newlines become CR;
+  NUL and ESC are removed. Input and replies never split a queued paste transaction.
+- Kitty keyboard negotiation implements all five enhancement flags, queries,
+  set/add/remove, and bounded push/pop stacks, independently on main and alternate
+  screens. Legacy input remains the default. xterm modifyOtherKeys levels 0–2
+  are used when Kitty enhancements are inactive.
+- Main/alternate screen modes 47/1047/1048/1049, application cursor/keypad modes,
+  basic device attributes, and status/cursor-position replies are supported.
+
+Scrollback history, selection/copy UI, images, fractional-scale protocols, and
+full xterm compatibility remain future work. Resizing preserves the top-left
+intersection without reflow. Blink is rendered steadily. Color-font SVG and
+COLRv1 painting are not supported.
 
 ## Structure
 
@@ -178,6 +205,9 @@ vertex/
 │   ├── terminal/
 │   │   ├── root.zig       # Public parser and screen APIs
 │   │   ├── Parser.zig     # Incremental VT and UTF-8 state machine
+│   │   ├── Session.zig    # Main/alternate screens, modes, and replies
+│   │   ├── Input.zig      # Portable keyboard, pointer, and paste encodings
+│   │   ├── Unicode.zig    # Grapheme boundaries and terminal widths
 │   │   ├── Screen.zig     # Grid, styles, cursor, editing, and scrolling
 │   │   ├── trace.zig      # Escaped event formatting
 │   │   ├── parser_tests.zig

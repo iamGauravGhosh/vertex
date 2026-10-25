@@ -11,6 +11,7 @@
         "assets",
         "docs",
         "tests",
+        "tools",
         "README.md",
         "LICENSE",
     },

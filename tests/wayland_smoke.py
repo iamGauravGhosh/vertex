@@ -75,6 +75,16 @@ def check_window(width, height, scale, renderer="gpu", fail_gpu=False):
                 rows, columns = map(int, report.read_text().split())
                 assert rows > 0 and columns > 0
                 print(f"Wayland {renderer} {width}x{height} scale {scale}: {columns}x{rows} cells, frame committed, child reaped")
+                protocol_report = root / "protocol-report"
+                protocol_environment = environment.copy()
+                protocol_environment["VERTEX_BIDI"] = "auto"
+                protocol_result = subprocess.run(
+                    [str(EXECUTABLE), "--", sys.executable,
+                     str(Path(__file__).with_name("terminal_probe.py").resolve()), str(protocol_report)],
+                    env=protocol_environment, capture_output=True, timeout=20, check=False,
+                )
+                assert protocol_result.returncode == 0, protocol_result.stderr.decode(errors="replace")
+                assert "passed" in protocol_report.read_text()
                 # A disconnected compositor must also hang up and reap a shell
                 # that is still running, rather than leave a background session.
                 pid_file = root / "child-pid"

@@ -193,6 +193,7 @@ test "incremental CPU and GPU frames match full redraws through edits cursor scr
         "\x1b[1;2H\x1b[31;1;3;4;9mf\x1b[0m", "\x1b[2;3H\x1b[2@XY",    "\x1b[P\x1b[K",        "\x1b[2;4r\x1b[S", "\x1b[T",
         "\x1b[3;1H\x1b[L",                   "\x1b[M",                "\x1b[44;7mZZ\x1b[0m", "\x1b[2J",         "\x1b[41;8mhidden\x1b[0m",
         "\x1b[1;1H\xf4\x8f\xbf\xbf",         "\x1bc",
+        "\x1b[38;2;1;127;254;48:2::3:5:7m界e\xcc\x81👩‍💻🇮🇳",
     };
     for (edits) |edit| {
         parser.feed(edit, &screen);
@@ -234,6 +235,84 @@ test "incremental CPU and GPU frames match full redraws through edits cursor scr
         const offset = ((height - 1 - i / width) * width + i % width) * 4;
         inline for (.{ 16, 8, 0 }, 0..) |shift, channel| try t.expect(@abs(@as(i32, @intCast((rgb >> shift) & 255)) - rgba[offset + channel]) <= 1);
     }
+}
+
+test "deterministic fallback font renders color glyphs in CPU and GPU" {
+    var renderer = try Renderer.initFontDirectory(t.allocator, "Vertex Test Mono", "tests/fonts");
+    defer renderer.deinit();
+    var screen = try vt.Screen.init(t.allocator, 1, 4);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("A😀\x1b[?25l", &screen);
+    const glyphs = try renderer.shapeRow(&screen, 0);
+    var fallback = false;
+    for (glyphs) |glyph| if (glyph.face != 0) {
+        fallback = true;
+    };
+    try t.expect(fallback);
+    const width = screen.columns * renderer.cell_width;
+    const height = renderer.cell_height;
+    const pixels = try t.allocator.alloc(u32, width * height);
+    defer t.allocator.free(pixels);
+    try renderer.draw(&screen, pixels, width, height);
+    var red = false;
+    var green = false;
+    for (pixels) |pixel| {
+        red = red or pixel == 0xff0000;
+        green = green or pixel == 0x00ff00;
+    }
+    try t.expect(red and green);
+    var gpu = @import("renderer/Gpu.zig").initHeadless(t.allocator, width, height) catch |err| {
+        if (c.getenv("VERTEX_TEST_GPU") != null) return err;
+        return error.SkipZigTest;
+    };
+    defer gpu.deinit();
+    var damage = Renderer.Damage.init(t.allocator);
+    defer damage.deinit();
+    _ = try damage.prepare(&screen, width, height, renderer.cell_height);
+    try gpu.render(&renderer, &screen, &damage);
+    try expectGpuPixels(&gpu, pixels);
+}
+
+test "true color channels reach the framebuffer without palette quantization" {
+    var renderer = try Renderer.initFontDirectory(t.allocator, "Vertex Test Mono", "tests/fonts");
+    defer renderer.deinit();
+    var screen = try vt.Screen.init(t.allocator, 1, 2);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("\x1b[38;2;17;129;253;48:2::3:5:7mA\x1b[?25l", &screen);
+    const width = renderer.cell_width * 2;
+    const height = renderer.cell_height;
+    const pixels = try t.allocator.alloc(u32, width * height);
+    defer t.allocator.free(pixels);
+    try renderer.draw(&screen, pixels, width, height);
+    var foreground = false;
+    var background = false;
+    for (pixels) |pixel| {
+        foreground = foreground or pixel == 0x1181fd;
+        background = background or pixel == 0x030507;
+    }
+    try t.expect(foreground and background);
+}
+
+test "bidi maps logical cells and resolves direction across soft-wrapped rows" {
+    var renderer = try Renderer.initFont(t.allocator, "DejaVu Sans");
+    defer renderer.deinit();
+    renderer.bidi = true;
+    var screen = try vt.Screen.init(t.allocator, 2, 4);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("אבגד12", &screen);
+    try t.expect(screen.soft_wrapped[0]);
+    try t.expectEqual(@as(usize, 3), try renderer.visualColumn(&screen, 0, 0));
+    try t.expectEqual(@as(usize, 0), try renderer.visualColumn(&screen, 0, 3));
+    // The second line inherits the RTL paragraph direction despite starting with numbers.
+    try t.expectEqual(@as(usize, 2), try renderer.visualColumn(&screen, 1, 0));
+    const width = screen.columns * renderer.cell_width;
+    const height = screen.rows * renderer.cell_height;
+    const pixels = try t.allocator.alloc(u32, width * height);
+    defer t.allocator.free(pixels);
+    try renderer.draw(&screen, pixels, width, height);
 }
 
 fn expectGpuPixels(gpu: *@import("renderer/Gpu.zig"), expected: []const u32) !void {
@@ -284,7 +363,7 @@ test "GPU batches survive atlas eviction and oversized tiled glyphs then window 
     // recycle all four pages while earlier quads are still being rendered.
     var tiles: usize = 0;
     for (renderer.atlas.pages) |page| {
-        try t.expectEqual(@as(usize, Renderer.Atlas.size * Renderer.Atlas.size), page.pixels.len);
+        try t.expectEqual(@as(usize, Renderer.Atlas.size * Renderer.Atlas.size * 4), page.pixels.len);
         var keys = page.entries.keyIterator();
         while (keys.next()) |key| if (key.x > 0 or key.y > 0) {
             tiles += 1;

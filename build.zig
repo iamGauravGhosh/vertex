@@ -32,28 +32,43 @@ pub fn build(b: *std.Build) void {
         const code_cmd = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
         code_cmd.addFileArg(xml);
         const code = code_cmd.addOutputFileArg("xdg-shell-protocol.c");
+        var extra_headers: [2]std.Build.LazyPath = undefined;
+        var extra_codes: [2]std.Build.LazyPath = undefined;
+        for ([_][]const u8{ "primary-selection", "text-input" }, [_][]const u8{ "unstable/primary-selection/primary-selection-unstable-v1.xml", "unstable/text-input/text-input-unstable-v3.xml" }, 0..) |name, path, i| {
+            const protocol_xml: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ protocols, path }) };
+            const header_generator = b.addSystemCommand(&.{ "wayland-scanner", "client-header" });
+            header_generator.addFileArg(protocol_xml);
+            extra_headers[i] = header_generator.addOutputFileArg(b.fmt("{s}-client-protocol.h", .{name}));
+            const code_generator = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+            code_generator.addFileArg(protocol_xml);
+            extra_codes[i] = code_generator.addOutputFileArg(b.fmt("{s}-protocol.c", .{name}));
+        }
         const bindings = b.addTranslateC(.{
             .root_source_file = b.path("src/platform/c.h"),
             .target = target,
             .optimize = optimize,
         });
         bindings.addIncludePath(header.dirname());
+        for (extra_headers) |extra| bindings.addIncludePath(extra.dirname());
         bindings.linkSystemLibrary("freetype2", .{});
         bindings.linkSystemLibrary("fontconfig", .{});
         bindings.linkSystemLibrary("wayland-client", .{});
         bindings.linkSystemLibrary("xkbcommon", .{});
         bindings.linkSystemLibrary("harfbuzz", .{});
+        bindings.linkSystemLibrary("fribidi", .{});
         bindings.linkSystemLibrary("egl", .{});
         bindings.linkSystemLibrary("glesv2", .{});
         bindings.linkSystemLibrary("wayland-egl", .{});
         const c_module = bindings.createModule();
         configureLinux(exe.root_module, c_module, code);
+        for (extra_codes) |extra| exe.root_module.addCSourceFile(.{ .file = extra });
         const integration = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("src/linux_tests.zig"),
             .target = target,
             .optimize = optimize,
         }) });
         configureLinux(integration.root_module, c_module, code);
+        for (extra_codes) |extra| integration.root_module.addCSourceFile(.{ .file = extra });
         linux_tests = b.addRunArtifact(integration);
     }
 
@@ -88,7 +103,7 @@ pub fn build(b: *std.Build) void {
 fn configureLinux(module: *std.Build.Module, bindings: *std.Build.Module, protocol: std.Build.LazyPath) void {
     module.addImport("c", bindings);
     module.link_libc = true;
-    for ([_][]const u8{ "wayland-client", "xkbcommon", "freetype2", "fontconfig", "harfbuzz", "EGL", "GLESv2", "wayland-egl", "util" }) |library| {
+    for ([_][]const u8{ "wayland-client", "xkbcommon", "freetype2", "fontconfig", "harfbuzz", "fribidi", "EGL", "GLESv2", "wayland-egl", "util" }) |library| {
         module.linkSystemLibrary(library, .{});
     }
     module.addCSourceFile(.{ .file = protocol });

@@ -7,6 +7,8 @@ const Gpu = @import("../renderer/Gpu.zig");
 const Pty = @import("Pty.zig");
 const input = @import("input.zig");
 const common = @import("common.zig");
+const Clipboard = @import("Clipboard.zig");
+const Ime = @import("Ime.zig");
 
 const Output = struct { app: *App, name: u32, object: *c.wl_output, scale: usize = 1, entered: bool = false };
 const Buffer = struct {
@@ -47,14 +49,24 @@ pub fn run(allocator: std.mem.Allocator, command: []const []const u8) !u8 {
     };
     var app: App = .{
         .allocator = allocator,
+        .clipboard = .{ .allocator = allocator },
+        .ime = .{ .allocator = allocator },
         .renderer = try Renderer.init(allocator),
         .screen = undefined,
+        .session = undefined,
         .mode = mode,
         .damage = Renderer.Damage.init(allocator),
     };
     defer app.deinit();
-    app.screen = try vt.Screen.init(allocator, 24, 80);
+    app.session = try vt.Session.init(allocator, 24, 80);
+    app.screen = app.session.activeScreen();
     app.screen_ready = true;
+    const bidi = c.getenv("VERTEX_BIDI");
+    if (bidi != null) {
+        const value = std.mem.span(bidi);
+        if (!std.mem.eql(u8, value, "off") and !std.mem.eql(u8, value, "auto")) return error.InvalidBidi;
+        app.renderer.bidi = std.mem.eql(u8, value, "auto");
+    }
     app.width = 80 * app.renderer.cell_width;
     app.height = 24 * app.renderer.cell_height;
     try app.connect();
@@ -64,7 +76,8 @@ pub fn run(allocator: std.mem.Allocator, command: []const []const u8) !u8 {
 const App = struct {
     allocator: std.mem.Allocator,
     renderer: Renderer,
-    screen: vt.Screen,
+    screen: *vt.Screen,
+    session: vt.Session = undefined,
     screen_ready: bool = false,
     mode: Gpu.Mode = .auto,
     gpu: ?Gpu = null,
@@ -85,6 +98,17 @@ const App = struct {
     frame: ?*c.wl_callback = null,
     seat: ?*c.wl_seat = null,
     keyboard: ?*c.wl_keyboard = null,
+    clipboard: Clipboard = .{ .allocator = std.heap.page_allocator },
+    ime: Ime = .{ .allocator = std.heap.page_allocator },
+    pointer: ?*c.wl_pointer = null,
+    pointer_inside: bool = false,
+    pointer_x: f64 = 0,
+    pointer_y: f64 = 0,
+    pointer_buttons: u8 = 0,
+    pointer_last: ?[2]usize = null,
+    axes: [2]f64 = @splat(0),
+    axis_values: [2]f64 = @splat(0),
+    axis_discrete: [2]i32 = @splat(0),
     xkb_context: ?*c.xkb_context = null,
     keymap: ?*c.xkb_keymap = null,
     key_state: ?*c.xkb_state = null,
@@ -95,12 +119,15 @@ const App = struct {
     repeat_delay: i32 = 0,
     repeat_key: ?u32 = null,
     composed_symbol: u32 = 0,
+    pressed: [256]?vt.Input.Key = @splat(null),
+    physical_down: [256]bool = @splat(false),
     composed_text: [96]u8 = undefined,
     composed_length: usize = 0,
     focused: bool = false,
     outputs: std.ArrayList(*Output) = .empty,
     buffers: std.ArrayList(*Buffer) = .empty,
     pending: std.ArrayList(u8) = .empty,
+    pending_offset: usize = 0,
     width: usize = 0,
     height: usize = 0,
     pending_width: usize = 0,
@@ -136,12 +163,31 @@ const App = struct {
         c.xdg_toplevel_set_title(self.toplevel, "Vertex");
         c.xdg_toplevel_set_app_id(self.toplevel, "vertex");
         c.xdg_toplevel_set_min_size(self.toplevel, @intCast(self.renderer.cell_width), @intCast(self.renderer.cell_height));
+        self.clipboard.setup(self.seat);
+        self.ime.surface = self.surface;
+        self.ime.setup(self.seat);
         c.wl_surface_commit(self.surface);
     }
 
     fn loop(self: *App, command: []const []const u8) !u8 {
         while (!self.closing) {
             if (self.failure) |failure| return failure;
+            if (self.clipboard.failure) |failure| return failure;
+            if (self.ime.failure) |failure| return failure;
+            if (self.ime.changed) {
+                self.screen.invalidateAll();
+                self.ime.changed = false;
+            }
+            const cursor = self.screen.getCursor();
+            if (self.ime.preedit.len == 0) self.ime.cursor(@intCast((try self.renderer.visualColumn(self.screen, cursor.row, cursor.column)) * self.renderer.cell_width), @intCast(cursor.row * self.renderer.cell_height), @intCast(self.renderer.cell_width), @intCast(self.renderer.cell_height));
+            if (self.ime.committed.items.len != 0) {
+                if (self.session.getModes().kitty & 8 != 0) {
+                    const encoded = try self.allocator.alloc(u8, self.ime.committed.items.len * 12 + 32);
+                    defer self.allocator.free(encoded);
+                    try self.queue(try vt.Input.encodeKey(encoded, .{ .code = 0, .text = self.ime.committed.items }, self.session.getModes()));
+                } else try self.queue(self.ime.committed.items);
+                self.ime.committed.clearRetainingCapacity();
+            }
             if (self.configured) {
                 try self.applySize();
                 if (self.pty == null) self.pty = try Pty.spawn(self.allocator, command, self.screen.rows, self.screen.columns);
@@ -149,7 +195,7 @@ const App = struct {
                 if (try self.pty.?.pollExit()) |status| {
                     // Reap the child independently of descendants retaining the slave.
                     try self.drainPty();
-                    for (self.parser.finish()) |event| if (event) |value| self.screen.handle(value);
+                    for (self.parser.finish()) |event| if (event) |value| self.session.handle(value);
                     return status;
                 }
                 try self.flushInput();
@@ -169,6 +215,7 @@ const App = struct {
                 .{ .fd = c.wl_display_get_fd(self.display), .events = display_events, .revents = 0 },
                 .{ .fd = if (self.pty != null and !self.pty_eof) self.pty.?.master else -1, .events = @as(c_short, c.POLLIN) | (if (self.pending.items.len > 0) @as(c_short, c.POLLOUT) else 0), .revents = 0 },
                 .{ .fd = self.repeat_fd, .events = c.POLLIN, .revents = 0 },
+                .{ .fd = self.clipboard.fd, .events = c.POLLIN, .revents = 0 },
             };
             const result = c.poll(&fds, fds.len, 100);
             if (result < 0) {
@@ -184,11 +231,27 @@ const App = struct {
             }
             if ((fds[0].revents & (c.POLLERR | c.POLLHUP | c.POLLNVAL)) != 0) return error.WaylandDisconnected;
             if (c.wl_display_dispatch_pending(self.display) < 0) return error.WaylandDisconnected;
+            if ((fds[3].revents & (c.POLLIN | c.POLLHUP | c.POLLERR)) != 0) {
+                const received = self.clipboard.read() catch |err| blk: {
+                    if (err == error.OutOfMemory) return err;
+                    std.debug.print("vertex: paste ignored ({s})\n", .{@errorName(err)});
+                    break :blk null;
+                };
+                if (received) |text| {
+                    defer self.allocator.free(text);
+                    const transaction = try vt.Input.paste(self.allocator, text, self.session.modes.bracketed_paste);
+                    defer self.allocator.free(transaction);
+                    self.queue(transaction) catch |err| {
+                        if (err != error.InputQueueFull) return err;
+                        std.debug.print("vertex: paste ignored (input queue full)\n", .{});
+                    };
+                }
+            }
             if ((fds[2].revents & c.POLLIN) != 0) {
                 var repeats: u64 = 0;
                 if (c.read(self.repeat_fd, &repeats, @sizeOf(u64)) > 0) {
                     if (self.repeat_key) |key| {
-                        for (0..@min(repeats, 32)) |_| _ = try self.sendKey(key, false);
+                        for (0..@min(repeats, 32)) |_| _ = try self.sendKey(key, .repeat);
                     }
                 }
             }
@@ -203,7 +266,7 @@ const App = struct {
         if (area > 64 * 1024 * 1024) return error.WindowTooLarge;
         const rows = @max(1, self.height / self.renderer.cell_height);
         const columns = @max(1, self.width / self.renderer.cell_width);
-        try self.screen.resize(rows, columns);
+        try self.session.resize(rows, columns);
         if (self.pty) |*pty| try pty.resize(rows, columns);
         try self.renderer.setScale(self.scale);
         c.wl_surface_set_buffer_scale(self.surface, @intCast(self.scale));
@@ -228,7 +291,10 @@ const App = struct {
                 self.pty_eof = true;
                 return;
             }
-            self.parser.feed(bytes[0..count], &self.screen);
+            self.parser.feed(bytes[0..count], &self.session);
+            if (self.session.takeError()) |err| return err;
+            try self.queue(self.session.replies.items);
+            self.session.replies.clearRetainingCapacity();
             budget -= count;
         }
     }
@@ -236,17 +302,19 @@ const App = struct {
     fn flushInput(self: *App) !void {
         if (self.pty_eof) {
             self.pending.clearRetainingCapacity();
+            self.pending_offset = 0;
             return;
         }
-        while (self.pending.items.len > 0) {
-            const count = self.pty.?.write(self.pending.items) catch |err| switch (err) {
+        while (self.pending_offset < self.pending.items.len) {
+            const count = self.pty.?.write(self.pending.items[self.pending_offset..]) catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => return err,
             };
             if (count == 0) return;
-            std.mem.copyForwards(u8, self.pending.items[0 .. self.pending.items.len - count], self.pending.items[count..]);
-            self.pending.items.len -= count;
+            self.pending_offset += count;
         }
+        self.pending.clearRetainingCapacity();
+        self.pending_offset = 0;
     }
 
     fn disableGpu(self: *App, failure: anyerror) !void {
@@ -267,10 +335,41 @@ const App = struct {
     fn draw(self: *App) !void {
         self.collectBuffers();
         if (self.frame != null) return;
+        if (self.renderer.bidi) {
+            for (self.screen.getDamageRows()) |dirty| if (dirty) {
+                self.screen.invalidateAll();
+                break;
+            };
+        }
+        var overlay: ?vt.Screen = null;
+        defer if (overlay) |*screen| screen.deinit();
+        var displayed = self.screen;
+        if (self.ime.preedit.len != 0) {
+            overlay = try self.screen.resized(self.screen.rows, self.screen.columns);
+            displayed = &overlay.?;
+            displayed.wrap_pending = self.screen.wrap_pending;
+            displayed.style.underline = true;
+            var iterator = (try std.unicode.Utf8View.init(self.ime.preedit)).iterator();
+            var caret = displayed.cursor;
+            const begin: usize = @intCast(@max(0, self.ime.cursor_begin));
+            const end: usize = @intCast(@max(0, self.ime.cursor_end));
+            while (iterator.nextCodepoint()) |cp| {
+                const offset = iterator.i - (std.unicode.utf8CodepointSequenceLength(cp) catch unreachable);
+                if (offset == begin) caret = displayed.cursor;
+                displayed.style.inverse = offset >= @min(begin, end) and offset < @max(begin, end);
+                if (cp >= 32 and !(cp >= 127 and cp <= 159)) try displayed.apply(.{ .print = cp });
+            }
+            if (begin >= self.ime.preedit.len) caret = displayed.cursor;
+            displayed.cursor = caret;
+            if (self.ime.cursor_begin < 0) displayed.cursor.visible = false;
+            @memcpy(displayed.damage_rows, self.screen.getDamageRows());
+            const point = displayed.cursor;
+            self.ime.cursor(@intCast((try self.renderer.visualColumn(displayed, point.row, point.column)) * self.renderer.cell_width), @intCast(point.row * self.renderer.cell_height), @intCast(self.renderer.cell_width), @intCast(self.renderer.cell_height));
+        }
         const width = self.width * self.scale;
         const height = self.height * self.scale;
         const damage = &self.damage.?;
-        if (!try damage.prepare(&self.screen, width, height, self.renderer.cell_height * self.scale)) return;
+        if (!try damage.prepare(displayed, width, height, self.renderer.cell_height * self.scale)) return;
         if (!self.backend_started) {
             self.backend_started = true;
             if (self.mode != .cpu) {
@@ -282,7 +381,7 @@ const App = struct {
             }
         }
         if (self.gpu) |*gpu| {
-            gpu.render(&self.renderer, &self.screen, damage) catch |err| {
+            gpu.render(&self.renderer, displayed, damage) catch |err| {
                 try self.disableGpu(err);
                 return self.draw();
             };
@@ -291,7 +390,8 @@ const App = struct {
                 try self.disableGpu(err);
                 return self.draw();
             };
-            damage.commit(&self.screen);
+            damage.commit(displayed);
+            if (overlay != null) self.screen.clearDamage();
             return;
         }
         var available: ?*Buffer = null;
@@ -309,10 +409,10 @@ const App = struct {
             self.allocator.free(self.pixels);
             self.pixels = replacement;
             damage.invalidate();
-            _ = try damage.prepare(&self.screen, width, height, self.renderer.cell_height * self.scale);
+            _ = try damage.prepare(displayed, width, height, self.renderer.cell_height * self.scale);
         }
         if (damage.full) @memset(self.pixels, Renderer.default_background);
-        try self.renderer.drawRows(&self.screen, self.pixels, width, height, damage.rows);
+        try self.renderer.drawRows(displayed, self.pixels, width, height, damage.rows);
         for (self.buffers.items) |item| {
             if (item.retired) continue;
             item.track(damage);
@@ -323,7 +423,8 @@ const App = struct {
         for (damage.rects.items) |rect| c.wl_surface_damage_buffer(self.surface, rect.x, rect.y, rect.width, rect.height);
         c.wl_surface_commit(self.surface);
         buffer.busy = true;
-        damage.commit(&self.screen);
+        damage.commit(displayed);
+        if (overlay != null) self.screen.clearDamage();
     }
 
     fn createBuffer(self: *App) !*Buffer {
@@ -381,14 +482,15 @@ const App = struct {
         if (self.repeat_fd >= 0) _ = c.timerfd_settime(self.repeat_fd, 0, &timer, null);
     }
 
-    fn sendKey(self: *App, key: u32, compose: bool) !bool {
+    fn sendKey(self: *App, key: u32, action: vt.Input.Action) !bool {
         if (!self.focused or self.key_state == null) return false;
+        if (action == .release and (key >= self.pressed.len or self.pressed[key] == null)) return false;
         const state = self.key_state.?;
         var symbol = c.xkb_state_key_get_one_sym(state, key);
         var text_buffer: [96]u8 = undefined;
         var text_len = c.xkb_state_key_get_utf8(state, key, &text_buffer, text_buffer.len);
-        if (compose) {
-            if (self.compose_state) |composer| {
+        if (action == .press) {
+            if (if (!self.ime.enabled) self.compose_state else null) |composer| {
                 _ = c.xkb_compose_state_feed(composer, symbol);
                 switch (c.xkb_compose_state_get_status(composer)) {
                     c.XKB_COMPOSE_COMPOSING => return false,
@@ -410,28 +512,98 @@ const App = struct {
                 }
             }
         }
-        if (!compose and self.composed_length > 0) {
+        if (action == .repeat and self.composed_length > 0) {
             symbol = self.composed_symbol;
             text_len = @intCast(self.composed_length);
             @memcpy(text_buffer[0..self.composed_length], self.composed_text[0..self.composed_length]);
         }
         if (text_len < 0 or text_len >= text_buffer.len) return false;
-        const mods: input.Modifiers = .{
-            .shift = c.xkb_state_mod_name_is_active(state, c.XKB_MOD_NAME_SHIFT, c.XKB_STATE_MODS_EFFECTIVE) > 0,
-            .alt = c.xkb_state_mod_name_is_active(state, c.XKB_MOD_NAME_ALT, c.XKB_STATE_MODS_EFFECTIVE) > 0,
-            .control = c.xkb_state_mod_name_is_active(state, c.XKB_MOD_NAME_CTRL, c.XKB_STATE_MODS_EFFECTIVE) > 0,
-        };
-        var encoded: [128]u8 = undefined;
-        const bytes = try input.encode(&encoded, symbol, text_buffer[0..@intCast(text_len)], mods);
-        if (self.pending.items.len + bytes.len > 65536) return error.InputQueueFull;
-        try self.pending.appendSlice(self.allocator, bytes);
+        const mods = self.modifiers();
+        if (action == .press and mods.shift and ((mods.control and (symbol == 'v' or symbol == 'V')) or symbol == c.XKB_KEY_Insert)) {
+            try self.clipboard.request(symbol == c.XKB_KEY_Insert);
+            return false;
+        }
+        var unshifted: [*c]const c.xkb_keysym_t = null;
+        const layout = c.xkb_state_key_get_layout(state, key);
+        const count = c.xkb_keymap_key_get_syms_by_level(self.keymap, key, layout, 0, &unshifted);
+        var code = input.code(if (count > 0) unshifted[0] else symbol);
+        if (self.composed_length > 0 or (symbol >= c.XKB_KEY_KP_Space and symbol <= c.XKB_KEY_KP_Equal)) code = input.code(symbol);
+        if (code == 0 and text_len == 0) return false;
+        // Correct modifier-key events even though the Wayland modifier update
+        // may arrive immediately after the key event.
+        var adjusted = mods;
+        if (action == .press and code == 57358) adjusted.caps_lock = !mods.caps_lock;
+        if (action == .press and code == 57360) adjusted.num_lock = !mods.num_lock;
+        if (code >= 57441 and code <= 57452) {
+            const active = if (action != .release) true else self.otherModifierHeld(key, code);
+            switch (code) {
+                57441, 57447 => adjusted.shift = active,
+                57442, 57448 => adjusted.control = active,
+                57443, 57449 => adjusted.alt = active,
+                57444, 57450 => adjusted.super = active,
+                57445, 57451 => adjusted.hyper = active,
+                57446, 57452 => adjusted.meta = active,
+                else => {},
+            }
+        }
+        var encoded: [2048]u8 = undefined;
+        var event: vt.Input.Key = .{ .code = code, .shifted = input.code(symbol), .base = input.baseKey(self.keymap.?, key), .text = text_buffer[0..@intCast(text_len)], .modifiers = adjusted, .action = action };
+        if (action == .release) {
+            const original = self.pressed[key].?;
+            event.code = original.code;
+            event.shifted = original.shifted;
+            event.base = original.base;
+            event.text = "";
+            self.pressed[key] = null;
+        }
+        const bytes = try input.encodeKey(&encoded, event, self.session.getModes());
+        if (action == .press and bytes.len != 0 and key < self.pressed.len) {
+            event.text = "";
+            self.pressed[key] = event;
+        }
+        try self.queue(bytes);
         return bytes.len > 0;
     }
 
+    fn otherModifierHeld(self: *const App, key: u32, code: u21) bool {
+        const pair: u21 = if (code <= 57446) code + 6 else code - 6;
+        for (self.physical_down, 0..) |down, index| {
+            if (!down or index == key) continue;
+            const symbol = c.xkb_state_key_get_one_sym(self.key_state, @intCast(index));
+            const other = input.code(symbol);
+            if (other == code or other == pair) return true;
+        }
+        return false;
+    }
+    fn queue(self: *App, bytes: []const u8) !void {
+        if (self.pending_offset != 0) {
+            std.mem.copyForwards(u8, self.pending.items[0 .. self.pending.items.len - self.pending_offset], self.pending.items[self.pending_offset..]);
+            self.pending.items.len -= self.pending_offset;
+            self.pending_offset = 0;
+        }
+        if (self.pending.items.len + bytes.len > vt.Input.max_paste_bytes + 65536) return error.InputQueueFull;
+        try self.pending.appendSlice(self.allocator, bytes);
+    }
+    fn modifiers(self: *const App) input.Modifiers {
+        const state = self.key_state orelse return .{};
+        return .{
+            .shift = c.xkb_state_mod_name_is_active(state, c.XKB_MOD_NAME_SHIFT, c.XKB_STATE_MODS_EFFECTIVE) > 0,
+            .alt = c.xkb_state_mod_name_is_active(state, c.XKB_MOD_NAME_ALT, c.XKB_STATE_MODS_EFFECTIVE) > 0,
+            .control = c.xkb_state_mod_name_is_active(state, c.XKB_MOD_NAME_CTRL, c.XKB_STATE_MODS_EFFECTIVE) > 0,
+            .super = c.xkb_state_mod_name_is_active(state, c.XKB_MOD_NAME_LOGO, c.XKB_STATE_MODS_EFFECTIVE) > 0,
+            .hyper = c.xkb_state_mod_name_is_active(state, "Hyper", c.XKB_STATE_MODS_EFFECTIVE) > 0,
+            .meta = c.xkb_state_mod_name_is_active(state, "Meta", c.XKB_STATE_MODS_EFFECTIVE) > 0,
+            .caps_lock = c.xkb_state_mod_name_is_active(state, c.XKB_MOD_NAME_CAPS, c.XKB_STATE_MODS_LOCKED) > 0,
+            .num_lock = c.xkb_state_mod_name_is_active(state, c.XKB_MOD_NAME_NUM, c.XKB_STATE_MODS_LOCKED) > 0,
+        };
+    }
     fn deinit(self: *App) void {
         if (self.pty) |*pty| pty.deinit();
         if (self.repeat_fd >= 0) _ = c.close(self.repeat_fd);
         if (self.frame) |object| c.wl_callback_destroy(object);
+        self.clipboard.deinit();
+        self.ime.deinit();
+        if (self.pointer) |object| releasePointer(object);
         if (self.keyboard) |object| releaseKeyboard(object);
         if (self.seat) |object| {
             if (c.wl_seat_get_version(object) >= 5) c.wl_seat_release(object) else c.wl_seat_destroy(object);
@@ -461,7 +633,7 @@ const App = struct {
         if (self.keymap) |keymap| c.xkb_keymap_unref(keymap);
         if (self.xkb_context) |context| c.xkb_context_unref(context);
         self.pending.deinit(self.allocator);
-        if (self.screen_ready) self.screen.deinit();
+        if (self.screen_ready) self.session.deinit();
         self.renderer.deinit();
         if (self.damage) |*damage| damage.deinit();
         self.allocator.free(self.pixels);
@@ -499,6 +671,12 @@ fn registryGlobal(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32, inter
     } else if (std.mem.eql(u8, kind, "wl_seat") and self.seat == null) {
         self.seat = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_seat_interface, @min(version, 5)));
         if (self.seat != null) _ = c.wl_seat_add_listener(self.seat, &seat_listener, self);
+    } else if (std.mem.eql(u8, kind, "wl_data_device_manager") and self.clipboard.manager == null) {
+        self.clipboard.manager = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_data_device_manager_interface, @min(version, 3)));
+    } else if (std.mem.eql(u8, kind, "zwp_primary_selection_device_manager_v1") and self.clipboard.primary_manager == null) {
+        self.clipboard.primary_manager = @ptrCast(c.wl_registry_bind(registry, name, &c.zwp_primary_selection_device_manager_v1_interface, 1));
+    } else if (std.mem.eql(u8, kind, "zwp_text_input_manager_v3") and self.ime.manager == null) {
+        self.ime.manager = @ptrCast(c.wl_registry_bind(registry, name, &c.zwp_text_input_manager_v3_interface, 1));
     } else if (std.mem.eql(u8, kind, "wl_output")) {
         const object: *c.wl_output = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_output_interface, @min(version, 2)) orelse {
             self.failure = error.WaylandObjectFailed;
@@ -587,12 +765,20 @@ fn outputScale(data: ?*anyopaque, _: ?*c.wl_output, scale: i32) callconv(.c) voi
 
 fn seatCapabilities(data: ?*anyopaque, seat: ?*c.wl_seat, capabilities: u32) callconv(.c) void {
     const self = appFrom(data);
+    if ((capabilities & c.WL_SEAT_CAPABILITY_POINTER) != 0 and self.pointer == null) {
+        self.pointer = c.wl_seat_get_pointer(seat);
+        if (self.pointer) |pointer| _ = c.wl_pointer_add_listener(pointer, &pointer_listener, self);
+    } else if ((capabilities & c.WL_SEAT_CAPABILITY_POINTER) == 0 and self.pointer != null) {
+        releasePointer(self.pointer.?);
+        self.pointer = null;
+        self.pointer_inside = false;
+        self.pointer_buttons = 0;
+    }
     if ((capabilities & c.WL_SEAT_CAPABILITY_KEYBOARD) != 0 and self.keyboard == null) {
         self.keyboard = c.wl_seat_get_keyboard(seat);
         if (self.keyboard != null) _ = c.wl_keyboard_add_listener(self.keyboard, &keyboard_listener, self);
     } else if ((capabilities & c.WL_SEAT_CAPABILITY_KEYBOARD) == 0 and self.keyboard != null) {
-        self.stopRepeat();
-        self.focused = false;
+        keyboardLeave(self, self.keyboard, 0, null);
         releaseKeyboard(self.keyboard.?);
         self.keyboard = null;
     }
@@ -632,24 +818,39 @@ fn keyboardKeymap(data: ?*anyopaque, _: ?*c.wl_keyboard, format: u32, fd: i32, s
     self.key_state = state;
 }
 fn keyboardEnter(data: ?*anyopaque, _: ?*c.wl_keyboard, _: u32, _: ?*c.wl_surface, _: ?*c.wl_array) callconv(.c) void {
-    appFrom(data).focused = true;
+    const self = appFrom(data);
+    self.focused = true;
+    if (self.screen_ready and self.session.modes.focus) self.queue("\x1b[I") catch |err| {
+        self.failure = err;
+    };
 }
 fn keyboardLeave(data: ?*anyopaque, _: ?*c.wl_keyboard, _: u32, _: ?*c.wl_surface) callconv(.c) void {
     const self = appFrom(data);
+    if (self.screen_ready and self.session.modes.focus) self.queue("\x1b[O") catch |err| {
+        self.failure = err;
+    };
     self.focused = false;
+    self.clipboard.cancel();
+    self.pressed = @splat(null);
+    self.physical_down = @splat(false);
+    self.ime.clear();
     self.stopRepeat();
     if (self.compose_state) |state| c.xkb_compose_state_reset(state);
 }
 fn keyboardKey(data: ?*anyopaque, _: ?*c.wl_keyboard, _: u32, _: u32, raw_key: u32, state: u32) callconv(.c) void {
     const self = appFrom(data);
     const key = raw_key + 8;
+    if (key < self.physical_down.len) self.physical_down[key] = state == c.WL_KEYBOARD_KEY_STATE_PRESSED;
     if (state == c.WL_KEYBOARD_KEY_STATE_RELEASED) {
+        _ = self.sendKey(key, .release) catch |err| {
+            self.failure = err;
+        };
         if (self.repeat_key == key) self.stopRepeat();
         return;
     }
     const repeatable = self.keymap != null and c.xkb_keymap_key_repeats(self.keymap, key) != 0;
     if (repeatable) self.stopRepeat();
-    const emitted = self.sendKey(key, true) catch |err| {
+    const emitted = self.sendKey(key, .press) catch |err| {
         self.failure = err;
         return;
     };
@@ -674,6 +875,102 @@ fn keyboardRepeat(data: ?*anyopaque, _: ?*c.wl_keyboard, rate: i32, delay: i32) 
     self.repeat_rate = @max(0, rate);
     self.repeat_delay = @max(0, delay);
 }
+
+fn releasePointer(object: *c.wl_pointer) void {
+    if (c.wl_pointer_get_version(object) >= 3) c.wl_pointer_release(object) else c.wl_pointer_destroy(object);
+}
+fn sendPointer(self: *App, kind: @FieldType(vt.Input.Pointer, "kind"), button: u8) void {
+    if (!self.pointer_inside or !self.screen_ready) return;
+    const x: usize = @intFromFloat(@max(0, self.pointer_x));
+    const y: usize = @intFromFloat(@max(0, self.pointer_y));
+    const col = @min(self.screen.columns - 1, x / self.renderer.cell_width);
+    const row = @min(self.screen.rows - 1, y / self.renderer.cell_height);
+    const mode = self.session.getModes();
+    const location = [2]usize{ if (mode.mouse_pixels) x else col, if (mode.mouse_pixels) y else row };
+    if (kind == .motion and self.pointer_last != null and std.mem.eql(usize, &location, &self.pointer_last.?)) return;
+    self.pointer_last = location;
+    var buffer: [128]u8 = undefined;
+    const bytes = vt.Input.encodePointer(&buffer, .{ .kind = kind, .button = button, .column = col, .row = row, .x = x, .y = y, .modifiers = self.modifiers() }, mode) catch |err| {
+        self.failure = err;
+        return;
+    };
+    self.queue(bytes) catch |err| {
+        self.failure = err;
+    };
+}
+fn pointerEnter(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: ?*c.wl_surface, x: c.wl_fixed_t, y: c.wl_fixed_t) callconv(.c) void {
+    const self = appFrom(data);
+    self.pointer_inside = true;
+    self.pointer_last = null;
+    self.pointer_x = @as(f64, @floatFromInt(x)) / 256;
+    self.pointer_y = @as(f64, @floatFromInt(y)) / 256;
+}
+fn pointerLeave(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: ?*c.wl_surface) callconv(.c) void {
+    const self = appFrom(data);
+    self.pointer_inside = false;
+    self.pointer_buttons = 0;
+    self.pointer_last = null;
+    self.axes = @splat(0);
+}
+fn pointerMotion(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, x: c.wl_fixed_t, y: c.wl_fixed_t) callconv(.c) void {
+    const self = appFrom(data);
+    self.pointer_x = @as(f64, @floatFromInt(x)) / 256;
+    self.pointer_y = @as(f64, @floatFromInt(y)) / 256;
+    const button: u8 = if (self.pointer_buttons & 1 != 0) 0 else if (self.pointer_buttons & 2 != 0) 1 else if (self.pointer_buttons & 4 != 0) 2 else 3;
+    sendPointer(self, .motion, button);
+}
+fn pointerButton(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: u32, button: u32, state: u32) callconv(.c) void {
+    const self = appFrom(data);
+    const number: u8 = switch (button) {
+        0x110 => 0,
+        0x112 => 1,
+        0x111 => 2,
+        else => return,
+    };
+    const pressed = state == c.WL_POINTER_BUTTON_STATE_PRESSED;
+    const bit = @as(u8, 1) << @intCast(number);
+    if (pressed) self.pointer_buttons |= bit else self.pointer_buttons &= ~bit;
+    if (number == 1 and pressed and (self.session.modes.mouse_tracking == 0 or self.modifiers().shift)) {
+        self.clipboard.request(true) catch |err| {
+            self.failure = err;
+        };
+    } else sendPointer(self, if (pressed) .press else .release, number);
+}
+fn pointerAxis(data: ?*anyopaque, pointer: ?*c.wl_pointer, _: u32, axis: u32, value: c.wl_fixed_t) callconv(.c) void {
+    const self = appFrom(data);
+    if (axis > 1) return;
+    self.axis_values[axis] += @as(f64, @floatFromInt(value)) / 2560;
+    if (c.wl_pointer_get_version(pointer) < 5) pointerFrame(data, pointer);
+}
+fn pointerFrame(data: ?*anyopaque, _: ?*c.wl_pointer) callconv(.c) void {
+    const self = appFrom(data);
+    for (0..2) |axis| {
+        self.axes[axis] += if (self.axis_discrete[axis] != 0) @as(f64, @floatFromInt(self.axis_discrete[axis])) else self.axis_values[axis];
+        const steps: i32 = @intFromFloat(std.math.clamp(@trunc(self.axes[axis]), -128, 128));
+        self.axes[axis] -= @as(f64, @floatFromInt(steps));
+        for (0..@intCast(@abs(steps))) |_| sendPointer(self, .wheel, if (axis == 0) (if (steps < 0) 64 else 65) else (if (steps < 0) 66 else 67));
+    }
+    self.axis_values = @splat(0);
+    self.axis_discrete = @splat(0);
+}
+fn pointerAxisSource(_: ?*anyopaque, _: ?*c.wl_pointer, _: u32) callconv(.c) void {}
+fn pointerAxisStop(_: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: u32) callconv(.c) void {}
+fn pointerAxisDiscrete(data: ?*anyopaque, _: ?*c.wl_pointer, axis: u32, discrete: i32) callconv(.c) void {
+    if (axis < 2) appFrom(data).axis_discrete[axis] += discrete;
+}
+const pointer_listener: c.wl_pointer_listener = blk: {
+    var value = std.mem.zeroes(c.wl_pointer_listener);
+    value.enter = pointerEnter;
+    value.leave = pointerLeave;
+    value.motion = pointerMotion;
+    value.button = pointerButton;
+    value.axis = pointerAxis;
+    value.frame = pointerFrame;
+    value.axis_source = pointerAxisSource;
+    value.axis_stop = pointerAxisStop;
+    value.axis_discrete = pointerAxisDiscrete;
+    break :blk value;
+};
 
 const registry_listener: c.wl_registry_listener = .{ .global = registryGlobal, .global_remove = registryRemove };
 const wm_listener: c.xdg_wm_base_listener = .{ .ping = wmPing };
@@ -714,6 +1011,33 @@ const buffer_listener: c.wl_buffer_listener = .{ .release = bufferRelease };
 
 fn releaseKeyboard(object: *c.wl_keyboard) void {
     if (c.wl_keyboard_get_version(object) >= 3) c.wl_keyboard_release(object) else c.wl_keyboard_destroy(object);
+}
+
+test "Wayland pointer callbacks encode drag release pixel and wheel events" {
+    var app: App = .{ .allocator = std.testing.allocator, .renderer = undefined, .screen = undefined };
+    app.session = try vt.Session.init(std.testing.allocator, 4, 10);
+    defer app.session.deinit();
+    defer app.pending.deinit(std.testing.allocator);
+    app.screen = app.session.activeScreen();
+    app.screen_ready = true;
+    app.renderer.cell_width = 8;
+    app.renderer.cell_height = 16;
+    app.session.modes.mouse_tracking = 1002;
+    app.session.modes.mouse_sgr = true;
+    pointerEnter(&app, null, 0, null, 8 * 256, 16 * 256);
+    pointerButton(&app, null, 0, 0, 0x110, c.WL_POINTER_BUTTON_STATE_PRESSED);
+    pointerMotion(&app, null, 0, 16 * 256, 16 * 256);
+    pointerButton(&app, null, 0, 0, 0x110, c.WL_POINTER_BUTTON_STATE_RELEASED);
+    pointerMotion(&app, null, 0, 24 * 256, 16 * 256);
+    pointerAxisDiscrete(&app, null, 0, -1);
+    pointerAxisDiscrete(&app, null, 1, 1);
+    pointerFrame(&app, null);
+    try std.testing.expectEqualStrings("\x1b[<0;2;2M\x1b[<32;3;2M\x1b[<0;3;2m\x1b[<64;4;2M\x1b[<67;4;2M", app.pending.items);
+    app.pending.clearRetainingCapacity();
+    app.session.modes.mouse_pixels = true;
+    pointerButton(&app, null, 0, 0, 0x111, c.WL_POINTER_BUTTON_STATE_PRESSED);
+    try std.testing.expectEqualStrings("\x1b[<2;25;17M", app.pending.items);
+    try std.testing.expect(app.failure == null);
 }
 
 test "keyboard focus loss disarms repeat in the kernel and clears composed input" {

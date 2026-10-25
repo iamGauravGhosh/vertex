@@ -2,6 +2,27 @@
 const std = @import("std");
 const vt = @import("vertex_terminal");
 
+test {
+    _ = @import("unicode_conformance.zig");
+}
+
+test "a public session consumer negotiates input and drains replies without OS dependencies" {
+    var session = try vt.Session.init(std.testing.allocator, 2, 8);
+    defer session.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("\x1b[>31u\x1b[?u\x1b[?2004h", &session);
+    if (session.takeError()) |err| return err;
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try session.drainReplies(&writer);
+    try std.testing.expectEqualStrings("\x1b[?31u", writer.buffered());
+    const key: vt.Input.Key = .{ .code = 27 };
+    try std.testing.expectEqualStrings("\x1b[27;1:1u", try vt.Input.encodeKey(&buffer, key, session.getModes()));
+    try session.resize(3, 10);
+    try std.testing.expectEqual(@as(usize, 10), session.activeScreen().columns);
+    try std.testing.expect(session.getModes().bracketed_paste);
+}
+
 test "a public screen consumer applies colors cursor movement and scrolling" {
     var screen = try vt.Screen.init(std.testing.allocator, 2, 4);
     defer screen.deinit();

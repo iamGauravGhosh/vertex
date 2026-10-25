@@ -145,7 +145,7 @@ fn initGl(self: *Gpu) !void {
         \\in vec2 uv;
         \\in vec3 rgb;
         \\out vec4 output_color;
-        \\void main() { output_color = vec4(rgb, masked ? texture(atlas, uv).r : 1.0); }
+        \\void main() { output_color = masked ? texture(atlas, uv) * vec4(rgb, 1.0) : vec4(rgb, 1.0); }
     );
     defer c.glDeleteShader(fs);
     self.program = c.glCreateProgram();
@@ -173,7 +173,7 @@ fn initGl(self: *Gpu) !void {
     textureParameters();
     c.glGenFramebuffers(1, &self.fbo);
     c.glEnable(c.GL_BLEND);
-    c.glBlendFuncSeparate(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA, c.GL_ONE, c.GL_ONE_MINUS_SRC_ALPHA);
+    c.glBlendFuncSeparate(c.GL_ONE, c.GL_ONE_MINUS_SRC_ALPHA, c.GL_ONE, c.GL_ONE_MINUS_SRC_ALPHA);
     c.glDisable(c.GL_DITHER);
     c.glPixelStorei(c.GL_UNPACK_ALIGNMENT, 1);
     try checkGl();
@@ -278,7 +278,7 @@ pub fn mask(self: *Gpu, atlas: *Atlas, region: Atlas.Region, x: i32, y: i32, cli
     const r = Renderer.intersect(Renderer.intersect(.{ .x = x, .y = y, .width = @intCast(region.width), .height = @intCast(region.height) }, clip), self.bounds());
     const ax = @as(f32, @floatFromInt(@as(i32, @intCast(region.x)) + r.x - x));
     const ay = @as(f32, @floatFromInt(@as(i32, @intCast(region.y)) + r.y - y));
-    try self.quad(r, .{ ax / Atlas.size, ay / Atlas.size, (ax + @as(f32, @floatFromInt(r.width))) / Atlas.size, (ay + @as(f32, @floatFromInt(r.height))) / Atlas.size }, rgb, true, region.page);
+    try self.quad(r, .{ ax / Atlas.size, ay / Atlas.size, (ax + @as(f32, @floatFromInt(r.width))) / Atlas.size, (ay + @as(f32, @floatFromInt(r.height))) / Atlas.size }, if (region.color) 0xffffff else rgb, true, region.page);
 }
 pub fn upload(self: *Gpu, atlas: *Atlas, region: Atlas.Region) !void {
     // A CPU painter may have populated this page since our last draw. A partial
@@ -288,7 +288,7 @@ pub fn upload(self: *Gpu, atlas: *Atlas, region: Atlas.Region) !void {
     }
     c.glBindTexture(c.GL_TEXTURE_2D, self.textures[region.page]);
     c.glPixelStorei(c.GL_UNPACK_ROW_LENGTH, Atlas.size);
-    c.glTexSubImage2D(c.GL_TEXTURE_2D, 0, @intCast(region.x), @intCast(region.y), @intCast(region.width), @intCast(region.height), c.GL_RED, c.GL_UNSIGNED_BYTE, atlas.pages[region.page].pixels.ptr + region.y * Atlas.size + region.x);
+    c.glTexSubImage2D(c.GL_TEXTURE_2D, 0, @intCast(region.x), @intCast(region.y), @intCast(region.width), @intCast(region.height), c.GL_RGBA, c.GL_UNSIGNED_BYTE, atlas.pages[region.page].pixels.ptr + (region.y * Atlas.size + region.x) * 4);
     c.glPixelStorei(c.GL_UNPACK_ROW_LENGTH, 0);
     self.atlas_revisions[region.page] = atlas.pages[region.page].revision;
     try checkGl();
@@ -306,7 +306,7 @@ pub fn syncAtlas(self: *Gpu, atlas: *Atlas) !void {
 fn syncPage(self: *Gpu, atlas: *Atlas, index: usize) !void {
     c.glBindTexture(c.GL_TEXTURE_2D, self.textures[index]);
     textureParameters();
-    c.glTexImage2D(c.GL_TEXTURE_2D, 0, c.GL_R8, Atlas.size, Atlas.size, 0, c.GL_RED, c.GL_UNSIGNED_BYTE, atlas.pages[index].pixels.ptr);
+    c.glTexImage2D(c.GL_TEXTURE_2D, 0, c.GL_RGBA8, Atlas.size, Atlas.size, 0, c.GL_RGBA, c.GL_UNSIGNED_BYTE, atlas.pages[index].pixels.ptr);
     self.texture_ready[index] = true;
     self.atlas_revisions[index] = atlas.pages[index].revision;
     try checkGl();

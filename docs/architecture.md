@@ -10,12 +10,13 @@ and resizable screen model. A separate stdin trace CLI remains available.
 - `src/cli.zig`: window-launch selection, `vertex parse`, and command-line help.
 - `src/terminal/`: allocation-free parsing and event tracing, plus an owned screen
   grid with colors, attributes, cursor state, editing, and scrolling regions.
-  Resizing preserves the top-left overlap without reflow. Scrollback and alternate
-  screens remain future milestones.
+  Resizing preserves the top-left overlap without reflow. Scrollback remains a future milestone. `Session` owns main/alternate grids,
+  negotiated input modes, keyboard stacks, and replies.
 - `src/renderer/`: Fontconfig font selection, HarfBuzz shaping, bounded FreeType
   atlas pages, row/cursor damage, GLES3 rendering, and a CPU reference backend.
 - `src/platform/`: native Wayland globals, xdg-shell, shared-memory buffers,
-  xkbcommon keyboard state, timer-based repeat, PTY, and child lifecycle.
+  xkbcommon keyboard state, timer-based repeat, pointer reporting, asynchronous
+  clipboard receiving, text-input-v3 IME, PTY, and child lifecycle.
 - `assets/fonts/`: reserved for future bundled fonts; the MVP uses system fonts.
 - `tests/`: public-module consumer and executable smoke checks.
 
@@ -34,25 +35,38 @@ The parser and screen model are exported as the `vertex_terminal` Zig module.
 The parser accepts byte chunks and emits syntax events; it does not set terminal
 modes, perform screen updates, write responses, or access the clipboard.
 `Screen.handle` consumes those events and applies supported text, style, cursor,
-and scrolling commands. The screen allocates at initialization and resize and
-processes events without allocation. See [the parser guide](vt-parser.md) for syntax and
+and scrolling commands. The screen allocates at initialization, resize, and
+when extending stored text clusters; ASCII and grid editing
+remain allocation-free. `Screen.apply` reports errors; parser-handler adapters
+latch them for retrieval after a feed. See [the parser guide](vt-parser.md) for syntax and
 [the screen guide](screen.md) for command execution and ownership.
 
 ## Text layout and atlas ownership
 
-Each row caches shaped glyph IDs, positions, source cell spans, and style/script
-runs. HarfBuzz uses left-to-right direction and monotone character clusters.
-Clusters are anchored to terminal columns and clipped to their source span;
-this does not change scalar-per-cell storage or introduce bidi/grapheme layout.
-Cursor colors clip the same shaped geometry to each cell without breaking a
-ligature. Scale changes refresh the HarfBuzz font and invalidate shaped rows.
+Each row caches shaped glyph IDs, font identity, positions, source cell spans,
+and a content fingerprint. Unicode 15.1 graphemes occupy one or two columns;
+continuation cells are never shaped independently. Fontconfig supplies fallback
+faces for complete clusters. HarfBuzz shapes script/style/font/direction runs.
+`VERTEX_BIDI=auto` uses FriBidi to resolve soft-wrapped logical paragraphs, then
+reorders each physical row while retaining logical-to-visual column mappings.
+The default `off` preserves fixed visual columns. Bidi paragraph edits invalidate
+presentation across the screen to account for changes on neighboring lines.
 
-FreeType rasterizes glyph IDs into four lazily allocated 1024×1024 grayscale
-pages. Shelf packing leaves padding, least-recently-used pages are recycled,
-and oversized bitmaps are tiled using bounded scratch storage. CPU and GPU
-share these masks; GLES uses R8 textures and uploads inserted regions. Pending
-GPU batches are submitted before atlas reuse. Cached shaping never stores atlas
-coordinates, and page revisions synchronize masks populated by either backend.
+FreeType rasterizes masks and color bitmaps/COLRv0 glyphs into four bounded,
+lazily allocated 1024×1024 RGBA atlas pages (16 MiB total pixel storage). Masks
+store premultiplied white; color glyphs retain premultiplied RGBA. Shelf packing,
+LRU recycling, padding, and bounded tiled scratch storage remain shared between
+CPU and GPU. Glyph cache keys include face and style. Both backends composite
+premultiplied pixels; the GPU flushes pending batches before atlas reuse.
+Row caches retain content fingerprints rather than pointers into mutable cluster
+storage. Scale changes resize all loaded faces and invalidate rows and atlases.
+
+Clipboard transfers use nonblocking pipes polled alongside Wayland, PTY, and
+repeat timers. Only complete bounded text transfers become paste transactions.
+A write offset preserves transaction ordering through short PTY writes.
+Text-input-v3 batches preedit/commits on `done`; preedit draws on a temporary grid
+and never alters application-owned terminal cells. The terminal does not advertise
+surrounding text because it cannot infer the application's editable buffer.
 
 ## Image extension boundary
 
@@ -124,4 +138,4 @@ instances at different geometries/scales, forces both backends, injects an EGL
 initialization failure to verify auto fallback, and checks partial damage and
 idle frame suppression. The optional `VERTEX_TEST_WAYLAND=1` integration
 test opens a real window, renders a short command, and checks its exit status.
-Full-screen applications, scrollback, grapheme layout, and images remain future work.
+Scrollback, selection/copy UI, images, and full xterm compatibility remain future work.
