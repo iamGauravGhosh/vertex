@@ -15,6 +15,9 @@ and negotiated modern keyboard input are supported.
 The project also includes a reusable VT parser, a terminal screen model, and a
 command-line event tracer.
 
+See [developer application compatibility](docs/compatibility.md) for editor,
+coding-agent and TUI checks, scrollback/selection behavior, and optional terminfo.
+
 Vertex works directly with your shell; multiplexers are optional. Run tmux,
 Zellij, or Herdr when you want tabs, split panes, layouts, or persistent sessions.
 Those features belong to the multiplexer. Vertex does not launch or install one
@@ -220,12 +223,13 @@ shows parser-to-screen integration and supported controls.
 The terminal targets basic shell work, including command editing, history,
 completion, Ctrl shortcuts, and output scrolling. It defaults to 80×24 cells unless
 the compositor assigns another size; configuration can change the initial dimensions.
-Appearance and input settings are configurable through TOML with live reload. Resizing preserves the top-left overlap without reflow and
-notifies the PTY. Server decorations can be requested when the compositor supports them.
+Appearance and input settings are configurable through TOML with live reload.
+The main screen and history rewrap during resize; alternate screens retain a
+fixed grid. Resizing notifies the PTY. Server decorations can be requested when the compositor supports them.
 There are no client-side decorations; use compositor shortcuts
 for moving, resizing, and closing the window.
 
-Unicode 15.1 extended graphemes retain combining marks and emoji sequences in
+Unicode 18.0 extended graphemes retain combining marks and emoji sequences in
 one cluster. Wide and emoji clusters occupy two columns; ambiguous characters
 occupy one. Fontconfig supplies fallback faces. FreeType color bitmaps and
 COLRv0 glyphs render in color in both backends; unsupported color-font formats
@@ -263,9 +267,10 @@ not advertised.
   over SSH. Decoding is streamed and capped at 8 MiB; clipboard reads are disabled.
   Publishing waits for window focus and a valid Wayland input serial.
 
-Scrollback history, selection/copy UI, image animation, fractional-scale protocols, and
-full xterm compatibility remain future work. Resizing preserves the top-left
-intersection without reflow. Cursor blinking is configurable and applications can request it. Text blink is rendered steadily. Color-font SVG and
+Main-screen history defaults to 10,000 rows / 64 MiB. Wheel or Shift+PageUp/PageDown
+scroll, dragging selects, and Ctrl+Shift+C copies. Shift bypasses application
+mouse tracking. Image animation, fractional-scale protocols, and full xterm
+compatibility remain future work. Cursor blinking is configurable and applications can request it. Text blink is rendered steadily. Color-font SVG and
 COLRv1 painting are not supported.
 
 ## Structure

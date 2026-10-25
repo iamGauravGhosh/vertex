@@ -78,6 +78,19 @@ pub fn build(b: *std.Build) void {
         const mux_step = b.step("test-multiplexers", "Check standalone, tmux, Zellij and Herdr locally and over isolated SSH");
         mux_step.dependOn(&mux_local.step);
         mux_step.dependOn(&mux_ssh.step);
+        const tui = b.addSystemCommand(&.{ "python3", "tests/tui_smoke.py" });
+        tui.addArtifactArg(mux_host);
+        tui.addArgs(&.{"--require-apps"});
+        const tui_step = b.step("test-tuis", "Check real editors TUIs and local mock-provider coding agents (isolated test dependencies required)");
+        tui_step.dependOn(&tui.step);
+        const tui_mux = b.addSystemCommand(&.{ "python3", "tests/tui_smoke.py" });
+        tui_mux.addArtifactArg(mux_host);
+        tui_mux.addArgs(&.{ "--apps", "nvim", "--require-apps", "--transports", "zellij", "herdr" });
+        tui_step.dependOn(&tui_mux.step);
+        const tui_ssh = b.addSystemCommand(&.{ "python3", "tests/ssh_multiplexer_smoke.py" });
+        tui_ssh.addArtifactArg(mux_host);
+        tui_ssh.addArgs(&.{ "--tui-only", "--tui-apps", "nvim", "hx", "lazygit" });
+        tui_step.dependOn(&tui_ssh.step);
         configureLinux(exe.root_module, c_module, code);
         for (extra_codes) |extra| exe.root_module.addCSourceFile(.{ .file = extra });
         const integration = b.addTest(.{ .root_module = b.createModule(.{

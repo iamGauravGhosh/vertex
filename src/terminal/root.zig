@@ -26,4 +26,5 @@ test {
     _ = @import("input_tests.zig");
     _ = @import("multiplexer_tests.zig");
     _ = @import("graphics_tests.zig");
+    _ = @import("compatibility_tests.zig");
 }

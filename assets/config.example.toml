@@ -61,6 +61,18 @@ action = "paste"
 key = "Insert"
 mods = "Shift"
 action = "paste_primary"
+[[keyboard.bindings]]
+key = "c"
+mods = "Control|Shift"
+action = "copy"
+[[keyboard.bindings]]
+key = "Page_Up"
+mods = "Shift"
+action = "scroll_page_up"
+[[keyboard.bindings]]
+key = "Page_Down"
+mods = "Shift"
+action = "scroll_page_down"
 
 [mouse]
 paste_button = "middle" # none, left, middle, right
@@ -72,6 +84,10 @@ wheel_multiplier = 1.0
 hide_when_typing = false
 
 [terminal]
+scrollback_lines = 10000
+scrollback_bytes = 67108864
+reflow = true
+visual_bell = 100
 shell = [] # empty selects $SHELL, account shell, or /bin/sh, with -i
 # working_directory = "~/Projects"
 bidi = "off"

@@ -32,17 +32,12 @@ pub fn joins(cluster: []const u21, cp: u21) bool {
     if ((a == .LVT or a == .T) and b == .T) return true;
     if (b == .Extend or b == .ZWJ or b == .SpacingMark or a == .Prepend) return true;
     if (lookup(&data.incb, cp) == 1) {
-        var linker = false;
         var i = cluster.len;
         while (i > 0) {
             i -= 1;
             switch (lookup(&data.incb, cluster[i])) {
-                3 => linker = true,
+                3 => return true,
                 2 => {},
-                1 => {
-                    if (linker) return true;
-                    break;
-                },
                 else => break,
             }
         }

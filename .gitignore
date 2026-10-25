@@ -10,3 +10,6 @@ zig-out/
 Thumbs.db
 *.swp
 *.swo
+__pycache__/
+tests/tui-fixtures/node_modules/
+tests/tui-fixtures/.venv/

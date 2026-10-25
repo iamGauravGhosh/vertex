@@ -7,6 +7,7 @@ allocator: std.mem.Allocator,
 rows: []bool = &.{},
 rects: std.ArrayList(Rect) = .empty,
 cursor: ?vt.Cursor = null,
+reverse_video: bool = false,
 width: usize = 0,
 height: usize = 0,
 invalid: bool = true,
@@ -30,7 +31,7 @@ pub fn prepare(self: *Damage, screen: *const vt.Screen, width: usize, height: us
         self.rows = replacement;
         self.invalid = true;
     }
-    self.full = self.invalid or width != self.width or height != self.height;
+    self.full = self.invalid or width != self.width or height != self.height or self.reverse_video != screen.reverse_video;
     self.width = width;
     self.height = height;
     @memcpy(self.rows, screen.getDamageRows());
@@ -62,6 +63,7 @@ pub fn prepare(self: *Damage, screen: *const vt.Screen, width: usize, height: us
     return self.rects.items.len != 0;
 }
 pub fn commit(self: *Damage, screen: *vt.Screen) void {
+    self.reverse_video = screen.reverse_video;
     self.cursor = screen.getCursor();
     self.invalid = false;
     screen.clearDamage();

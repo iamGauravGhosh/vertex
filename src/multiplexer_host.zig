@@ -26,12 +26,16 @@ fn writeAll(fd: c_int, bytes: []const u8) !void {
         offset += @intCast(n);
     }
 }
-fn snapshot(allocator: std.mem.Allocator, session: *vt.Session, clipboard: ?[]const u8) !void {
+fn snapshot(allocator: std.mem.Allocator, session: *vt.Session, clipboard: ?[]const u8, exit_status: ?u8, requested_details: bool) !void {
     const screen = session.activeScreen();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch = arena.allocator();
     const lines = try scratch.alloc([]const u8, screen.rows);
+    const details = requested_details or c.getenv("VERTEX_HOST_DETAILS") != null;
+    const styles = try scratch.alloc([]const vt.Style, if (details) screen.rows else 0);
+    const widths = try scratch.alloc([]const u2, if (details) screen.rows else 0);
+    const graphemes = try scratch.alloc([]const []const u21, if (details) screen.rows else 0);
     for (lines, 0..) |*line, row| {
         var text: std.ArrayList(u8) = .empty;
         for (0..screen.columns) |col| {
@@ -42,8 +46,21 @@ fn snapshot(allocator: std.mem.Allocator, session: *vt.Session, clipboard: ?[]co
             }
         }
         line.* = text.items;
+        if (details) {
+            const style = try scratch.alloc(vt.Style, screen.columns);
+            const width = try scratch.alloc(u2, screen.columns);
+            const clusters = try scratch.alloc([]const u21, screen.columns);
+            for (screen.getRow(row).?, 0..) |cell, col| {
+                style[col] = cell.style;
+                width[col] = cell.width;
+                clusters[col] = screen.getGrapheme(row, col).?;
+            }
+            styles[row] = style;
+            widths[row] = width;
+            graphemes[row] = clusters;
+        }
     }
-    const json = try std.json.Stringify.valueAlloc(scratch, .{ .rows = screen.rows, .columns = screen.columns, .lines = lines, .cursor = screen.cursor, .alternate = session.alternate, .modes = session.getModes(), .clipboard = clipboard }, .{});
+    const json = try std.json.Stringify.valueAlloc(scratch, .{ .rows = screen.rows, .columns = screen.columns, .lines = lines, .styles = styles, .widths = widths, .graphemes = graphemes, .cursor = screen.cursor, .alternate = session.alternate, .modes = session.getModes(), .clipboard = clipboard, .history = session.historyCount(), .exit_status = exit_status }, .{});
     try writeAll(1, json);
     try writeAll(1, "\n");
 }
@@ -58,6 +75,7 @@ fn run(args: []const []const u8) !void {
     defer if (trace >= 0) {
         _ = c.close(trace);
     };
+    var trace_bytes: usize = 0;
     var session = try vt.Session.init(allocator, 24, 80);
     defer session.deinit();
     var parser = vt.Parser.initWithOptions(.{ .osc_mode = .streaming });
@@ -89,7 +107,11 @@ fn run(args: []const []const u8) !void {
                     else => return err,
                 };
                 if (count == 0) break;
-                if (trace >= 0) try writeAll(trace, bytes[0..count]);
+                if (trace >= 0 and trace_bytes < 32 * 1024 * 1024) {
+                    const length = @min(count, 32 * 1024 * 1024 - trace_bytes);
+                    try writeAll(trace, bytes[0..length]);
+                    trace_bytes += length;
+                }
                 parser.feed(bytes[0..count], &session);
                 if (session.takeError()) |err| return err;
                 try pending.appendSlice(allocator, session.replies.items);
@@ -135,7 +157,7 @@ fn run(args: []const []const u8) !void {
                     try session.resize(rows, columns);
                     try child.resize(rows, columns);
                 }
-                if (object.get("snapshot") != null) try snapshot(allocator, &session, clipboard);
+                if (object.get("snapshot") != null) try snapshot(allocator, &session, clipboard, child.status, if (object.get("details")) |value| value.bool else false);
                 if (object.get("close") != null) return;
                 std.mem.copyForwards(u8, commands.items, commands.items[end + 1 ..]);
                 commands.items.len -= end + 1;

@@ -29,6 +29,7 @@ pub const Modes = struct {
     modify_other_keys: u2 = 0,
     application_cursor: bool = false,
     application_keypad: bool = false,
+    newline_mode: bool = false,
     bracketed_paste: bool = false,
     mouse_tracking: u16 = 0,
     mouse_sgr: bool = false,
@@ -36,6 +37,7 @@ pub const Modes = struct {
     /// Hosts with configurable local modifiers can handle bypass themselves.
     mouse_shift_bypass: bool = true,
     focus: bool = false,
+    alternate_scroll: bool = true,
 };
 
 pub fn encodeKey(buffer: []u8, event: Key, modes: Modes) ![]const u8 {
@@ -53,7 +55,7 @@ pub fn encodeKey(buffer: []u8, event: Key, modes: Modes) ![]const u8 {
     const special = key.code >= 57344 and key.code <= 57454;
     if (key.code >= 57441 and key.code <= 57454 and flags & 8 == 0) return buffer[0..0];
     const ordinary_control = key.code == 57345 or key.code == 57346 or key.code == 57347;
-    const enhanced = all or (flags & 1 != 0 and ((!ordinary_control and special) or mods.control or mods.alt or (ordinary_control and mods.shift))) or (flags & 2 != 0 and special and !ordinary_control) or
+    const enhanced = all or (flags & 1 != 0 and ((!ordinary_control and special) or mods.control or mods.alt or mods.super or mods.hyper or mods.meta or (ordinary_control and mods.shift))) or (flags & 2 != 0 and special and !ordinary_control) or
         (special and ((key.code >= 57376 and key.code <= 57398) or (key.code >= 57428 and key.code <= 57440)) and key.text.len == 0);
     if (key.action == .release and (flags & 2 == 0 or !enhanced)) return buffer[0..0];
     if (enhanced) {
@@ -133,8 +135,8 @@ pub fn encodeKey(buffer: []u8, event: Key, modes: Modes) ![]const u8 {
     var byte: [1]u8 = undefined;
     const text: []const u8 = switch (key.code) {
         57344 => "\x1b",
-        57345, 57414 => "\r",
-        57346 => if (mods.shift) return std.fmt.bufPrint(buffer, "\x1b[Z", .{}) else "\t",
+        57345, 57414 => if (modes.newline_mode) "\r\n" else "\r",
+        57346 => if (mods.shift) return std.fmt.bufPrint(buffer, "{s}\x1b[Z", .{if (mods.alt) "\x1b" else ""}) else "\t",
         57347 => if (mods.control) "\x08" else "\x7f",
         else => blk: {
             if (mods.control) {

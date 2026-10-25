@@ -36,7 +36,7 @@ pub fn spawnConfigured(allocator: std.mem.Allocator, command: []const []const u8
     var index: usize = 0;
     while (c.environ[index] != null) : (index += 1) {
         const value = std.mem.span(c.environ[index]);
-        if (std.mem.startsWith(u8, value, "TERM=") or std.mem.startsWith(u8, value, "COLORTERM=")) continue;
+        if (std.mem.startsWith(u8, value, "TERM=") or std.mem.startsWith(u8, value, "COLORTERM=") or std.mem.startsWith(u8, value, "TERM_PROGRAM=") or std.mem.startsWith(u8, value, "TERM_PROGRAM_VERSION=")) continue;
         var overridden = false;
         for (options.env) |entry| if (std.mem.startsWith(u8, value, entry.name) and value.len > entry.name.len and value[entry.name.len] == '=') {
             overridden = true;
@@ -46,13 +46,19 @@ pub fn spawnConfigured(allocator: std.mem.Allocator, command: []const []const u8
     }
     var term = false;
     var colorterm = false;
+    var term_program = false;
+    var term_version = false;
     for (options.env) |entry| {
         try environment.append(scratch, try std.fmt.allocPrintSentinel(scratch, "{s}={s}", .{ entry.name, entry.value }, 0));
         term = term or std.mem.eql(u8, entry.name, "TERM");
         colorterm = colorterm or std.mem.eql(u8, entry.name, "COLORTERM");
+        term_program = term_program or std.mem.eql(u8, entry.name, "TERM_PROGRAM");
+        term_version = term_version or std.mem.eql(u8, entry.name, "TERM_PROGRAM_VERSION");
     }
     if (!term) try environment.append(scratch, "TERM=xterm-256color");
     if (!colorterm) try environment.append(scratch, "COLORTERM=truecolor");
+    if (!term_program) try environment.append(scratch, "TERM_PROGRAM=vertex");
+    if (!term_version) try environment.append(scratch, "TERM_PROGRAM_VERSION=0.0.1");
     try environment.append(scratch, null);
     var errors: [2]c_int = undefined;
     if (c.pipe2(&errors, c.O_CLOEXEC) != 0) return error.PipeFailed;

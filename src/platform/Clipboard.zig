@@ -15,6 +15,7 @@ const Source = struct {
     object: *c.wl_data_source,
     bytes: []u8,
 };
+const PrimarySource = struct { clipboard: *Clipboard, object: *c.zwp_primary_selection_source_v1, bytes: []u8 };
 const Transfer = struct { fd: c_int, bytes: []u8, offset: usize = 0 };
 allocator: std.mem.Allocator,
 manager: ?*c.wl_data_device_manager = null,
@@ -28,6 +29,8 @@ fd: c_int = -1,
 bytes: std.ArrayList(u8) = .empty,
 failure: ?anyerror = null,
 source: ?*Source = null,
+primary_source: ?*PrimarySource = null,
+primary_outgoing: ?[]u8 = null,
 outgoing: ?[]u8 = null,
 serial: ?u32 = null,
 focused: bool = false,
@@ -38,8 +41,31 @@ pub fn set(self: *Clipboard, bytes: []u8) void {
     if (self.outgoing) |old| self.allocator.free(old);
     self.outgoing = bytes;
 }
+pub fn setPrimary(self: *Clipboard, bytes: []u8) void {
+    if (self.primary_outgoing) |old| self.allocator.free(old);
+    self.primary_outgoing = bytes;
+}
+fn destroyPrimary(self: *Clipboard, source: *PrimarySource) void {
+    c.zwp_primary_selection_source_v1_destroy(source.object);
+    self.allocator.free(source.bytes);
+    self.allocator.destroy(source);
+}
 /// A fresh input serial is required after focus is acquired. Never invent one.
 pub fn publish(self: *Clipboard) !void {
+    if (self.focused and self.serial != null and self.primary_outgoing != null and self.primary_manager != null and self.primary_device != null) {
+        const object = c.zwp_primary_selection_device_manager_v1_create_source(self.primary_manager) orelse return error.WaylandObjectFailed;
+        errdefer c.zwp_primary_selection_source_v1_destroy(object);
+        const source = try self.allocator.create(PrimarySource);
+        errdefer self.allocator.destroy(source);
+        source.* = .{ .clipboard = self, .object = object, .bytes = self.primary_outgoing.? };
+        if (c.zwp_primary_selection_source_v1_add_listener(object, &primary_source_listener, source) != 0) return error.WaylandListenerFailed;
+        c.zwp_primary_selection_source_v1_offer(object, "text/plain;charset=utf-8");
+        c.zwp_primary_selection_source_v1_offer(object, "text/plain");
+        c.zwp_primary_selection_device_v1_set_selection(self.primary_device, object, self.serial.?);
+        if (self.primary_source) |old| self.destroyPrimary(old);
+        self.primary_source = source;
+        self.primary_outgoing = null;
+    }
     if (!self.focused or self.serial == null or self.outgoing == null or self.manager == null or self.device == null) return;
     const object = c.wl_data_device_manager_create_data_source(self.manager) orelse return error.WaylandObjectFailed;
     errdefer c.wl_data_source_destroy(object);
@@ -153,6 +179,8 @@ pub fn deinit(self: *Clipboard) void {
     self.cancel();
     for (&self.transfers) |*slot| self.finishTransfer(slot);
     if (self.source) |source| self.destroySource(source);
+    if (self.primary_source) |source| self.destroyPrimary(source);
+    if (self.primary_outgoing) |bytes| self.allocator.free(bytes);
     if (self.outgoing) |bytes| self.allocator.free(bytes);
     for (self.offers.items) |offer| self.destroyOffer(offer);
     self.offers.deinit(self.allocator);
@@ -299,13 +327,15 @@ fn sourceActions(_: ?*anyopaque, _: ?*c.wl_data_offer, _: u32) callconv(.c) void
 fn sourceTarget(_: ?*anyopaque, _: ?*c.wl_data_source, _: [*c]const u8) callconv(.c) void {}
 fn sourceSend(data: ?*anyopaque, _: ?*c.wl_data_source, mime: [*c]const u8, fd: i32) callconv(.c) void {
     const source: *Source = @ptrCast(@alignCast(data.?));
-    const self = source.clipboard;
+    sendSource(source.clipboard, source.bytes, mime, fd);
+}
+fn sendSource(self: *Clipboard, text: []const u8, mime: [*c]const u8, fd: i32) void {
     const name = std.mem.span(mime);
     if (std.mem.eql(u8, name, "text/plain;charset=utf-8") or std.mem.eql(u8, name, "UTF8_STRING") or std.mem.eql(u8, name, "text/plain")) {
         for (&self.transfers) |*slot| if (slot.* == null) {
             const flags = c.fcntl(fd, c.F_GETFL);
             if (flags < 0 or c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK) < 0) break;
-            const bytes = self.allocator.dupe(u8, source.bytes) catch break;
+            const bytes = self.allocator.dupe(u8, text) catch break;
             slot.* = .{ .fd = fd, .bytes = bytes };
             return;
         };
@@ -321,6 +351,17 @@ fn sourceCancelled(data: ?*anyopaque, _: ?*c.wl_data_source) callconv(.c) void {
 fn sourceDrop(_: ?*anyopaque, _: ?*c.wl_data_source) callconv(.c) void {}
 fn sourceAction(_: ?*anyopaque, _: ?*c.wl_data_source, _: u32) callconv(.c) void {}
 const data_source_listener: c.wl_data_source_listener = .{ .target = sourceTarget, .send = sourceSend, .cancelled = sourceCancelled, .dnd_drop_performed = sourceDrop, .dnd_finished = sourceDrop, .action = sourceAction };
+fn primarySend(data: ?*anyopaque, _: ?*c.zwp_primary_selection_source_v1, mime: [*c]const u8, fd: i32) callconv(.c) void {
+    const source: *PrimarySource = @ptrCast(@alignCast(data.?));
+    sendSource(source.clipboard, source.bytes, mime, fd);
+}
+fn primaryCancelled(data: ?*anyopaque, _: ?*c.zwp_primary_selection_source_v1) callconv(.c) void {
+    const source: *PrimarySource = @ptrCast(@alignCast(data.?));
+    const self = source.clipboard;
+    if (self.primary_source == source) self.primary_source = null;
+    self.destroyPrimary(source);
+}
+const primary_source_listener: c.zwp_primary_selection_source_v1_listener = .{ .send = primarySend, .cancelled = primaryCancelled };
 
 test "clipboard source sends are bounded nonblocking and survive source replacement" {
     const t = std.testing;

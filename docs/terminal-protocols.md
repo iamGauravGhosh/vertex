@@ -24,7 +24,9 @@ const bytes = try vt.Input.encodeKey(buffer, event, modes);
 
 The screen pointer addresses the active screen field; screen switches exchange
 its contents and invalidate borrowed rows. `resize()` prepares both grids before
-committing, preserves top-left overlap without reflow, and retains input modes.
+committing and retains input modes. Default public sessions preserve top-left
+overlap. Optional `Session.Options` history/reflow settings enable main-screen
+text reflow; alternate screens keep their fixed grid.
 RIS (`ESC c`) resets both screens, negotiated modes, and stacks. Reply draining
 acknowledges bytes only after the writer succeeds; a writer that partially writes
 before failing must not retry the whole queue without accounting for its progress.
@@ -42,11 +44,13 @@ pixels. CSI 14/16/18 `t` query surface pixels, cell pixels, and terminal rows/co
 Unset pixel geometry produces no fabricated reply. DECRQM reports implemented
 private modes as set/reset and unknown modes as unrecognized. Secondary device
 attributes identify a conservative VT100 class rather than claiming VT420 support.
-XTGETTCAP handles `TN`, `Co`/`colors`, `RGB`/`Tc`, `Ms`, and `Sync`; unknown names
-receive a failure reply. DECRQSS reports vertical/horizontal margins and cursor
+XTGETTCAP handles `TN`, `Co`/`colors`, `RGB`/`Tc`, `Ms`, `Sync`, `Su`, `Smulx` and `Setulc`; unknown names
+receive a failure reply. DECRQSS reports SGR, vertical/horizontal margins and cursor
 shape; other status strings receive a failure reply. These are bounded handlers,
 not general DCS passthrough. OSC 4, 10, and 11 queries use the renderer's shared
-palette and defaults; palette mutation is not implemented.
+palette and defaults. OSC 4/10/11/12 mutate colors, and 104/110/111/112 restore
+the configured baseline. Hosts use `setTheme()` for configuration reload and
+observe `color_generation` to update painters. `takeBell()` consumes a pending bell.
 
 Input modes include DEC application cursor/keypad, focus, bracketed paste, and
 mouse tracking/encoding. `Session` applies DECSET/DECRST, alternate screens
@@ -89,11 +93,34 @@ At most four asynchronous sends are active, sharing a 64 KiB write budget per
 event-loop turn. Each owns its bytes so replacing a source cannot invalidate an
 in-flight send. Slow or closed recipients do not block keyboard/PTY processing.
 
-Unicode segmentation data and its conformance fixture are pinned to 15.1.0.
+Unicode segmentation data and its conformance fixture are pinned to 18.0.0.
 Regenerate with `python3 tools/generate_unicode.py /path/to/UCD.zip`. Generated
 tables and original test fonts are committed; builds perform no downloads.
 `tools/generate_test_fonts.py` rebuilds the tiny MIT-licensed fonts using
 FontTools 4.60.1. Bidi behavior uses the installed FriBidi Unicode implementation.
+
+## History, reflow and selection API
+
+`Session.init()` keeps the dependency-free fixed-grid defaults. Hosts can use
+`initWithOptions(..., .{ .history = true, .history_lines = 10000,
+.history_bytes = 64 * 1024 * 1024, .reflow = true })` to enable the history
+layer. Existing `images` and `decoder` options remain available.
+
+`historyCount()`, `scroll(lines)`, `live()`, `point(row, column)`, `select(first,
+end)`, `selectWord(point, whole_row)` and `copySelection(allocator)` operate
+without OS dependencies. Positions use row IDs stable during output scrolling
+and cell columns; selection
+ends are exclusive. `copySelection()` returns owned UTF-8. `viewport()` returns
+an owned Screen snapshot for history/selection presentation; deinitialize it
+after use. Cached external positions must be reacquired after a resize; Session
+remaps its own selection. Its cursor is hidden while scrolled. None of these APIs move the live
+application cursor. Resize remaps anchors transactionally and retains the old
+screen/history on allocation failure. Images remain live-grid placements.
+
+Grapheme mode 2027 reports permanently set. ANSI 4/20 queries report the actual
+insert/newline state. `DECRQSS m` reports current SGR, including underline style
+and colors, so application feature probes can succeed without terminal-name
+heuristics. See [application checks and limits](compatibility.md).
 
 Protocol references: [Kitty keyboard](https://sw.kovidgoyal.net/kitty/keyboard-protocol/),
 [xterm controls](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html),

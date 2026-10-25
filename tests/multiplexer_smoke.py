@@ -19,15 +19,15 @@ class Host:
         environment = dict(environment, VERTEX_HOST_COMMAND=json.dumps(command), VERTEX_HOST_TRACE=str(root / "pty.trace"))
         self.process = subprocess.Popen(
             [str(executable), *([] if environment.get("VERTEX_HOST_TEST_DRIVER") == "1" else command)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=self.log, env=environment, text=True, bufsize=1,
+            stderr=self.log, env=environment, cwd=root, text=True, bufsize=1,
         )
 
     def send(self, **command):
         self.process.stdin.write(json.dumps(command) + "\n")
         self.process.stdin.flush()
 
-    def snapshot(self):
-        self.send(snapshot=True)
+    def snapshot(self, details=False):
+        self.send(snapshot=True, details=details)
         if not select.select([self.process.stdout], [], [], 5)[0]:
             self.log.seek(0)
             raise AssertionError(f"host snapshot timeout: {self.log.read()}")
@@ -45,7 +45,8 @@ class Host:
             if predicate(state):
                 return state
             time.sleep(0.03)
-        raise AssertionError(f"{description}: {json.dumps(state, ensure_ascii=False)}")
+        summary = {key: value for key, value in (state or {}).items() if key not in ("styles", "widths", "graphemes")}
+        raise AssertionError(f"{description}: {json.dumps(summary, ensure_ascii=False)}")
 
     def text(self, needle):
         return self.wait(lambda state: needle in "\n".join(state["lines"]), needle)
@@ -59,7 +60,8 @@ class Host:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
-        self.process.stdin.close()
+        with contextlib.suppress(BrokenPipeError):
+            self.process.stdin.close()
         self.process.stdout.close()
         self.log.close()
 

@@ -48,7 +48,7 @@ pub fn code(symbol: u32) u21 {
         c.XKB_KEY_KP_Equal => 57415,
         c.XKB_KEY_KP_Separator => 57416,
         c.XKB_KEY_KP_Begin => 57427,
-        c.XKB_KEY_XF86AudioPlay => 57430,
+        c.XKB_KEY_XF86AudioPlay => 57428,
         c.XKB_KEY_XF86AudioPause => 57429,
         c.XKB_KEY_XF86AudioStop => 57432,
         c.XKB_KEY_XF86AudioForward => 57433,

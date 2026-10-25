@@ -1,0 +1,13 @@
+{
+  "name": "vertex-tui-fixtures",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.28.2",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.300",
+    "@openai/codex": "0.164.0",
+    "ink": "8.0.0",
+    "opencode-ai": "1.19.4",
+    "react": "19.3.0"
+  }
+}

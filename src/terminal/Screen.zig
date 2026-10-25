@@ -5,6 +5,7 @@ const Parser = @import("Parser.zig");
 const Screen = @This();
 const Unicode = @import("Unicode.zig");
 const Links = @import("Links.zig");
+pub const History = @import("History.zig");
 pub const Graphics = @import("Graphics.zig");
 var next_identity = std.atomic.Value(u64).init(1);
 
@@ -21,6 +22,8 @@ pub const Style = struct {
     faint: bool = false,
     italic: bool = false,
     underline: bool = false,
+    underline_style: enum { single, double, curly, dotted, dashed } = .single,
+    underline_color: Color = .default,
     blink: bool = false,
     inverse: bool = false,
     hidden: bool = false,
@@ -70,6 +73,8 @@ damage_rows: []bool,
 row_generations: []u64,
 tab_stops: []bool,
 soft_wrapped: []bool,
+/// Actual text columns before a soft wrap (a wide glyph can leave a spare cell).
+wrap_columns: []usize,
 cursor: Cursor = .{},
 default_cursor: Cursor = .{},
 style: Style = .{},
@@ -78,6 +83,9 @@ scroll_bottom: usize,
 scroll_left: usize = 0,
 scroll_right: usize,
 left_right_mode: bool = false,
+insert_mode: bool = false,
+newline_mode: bool = false,
+reverse_video: bool = false,
 charsets: [2]bool = .{ false, false },
 active_charset: u1 = 0,
 repeat_codepoint: ?u21 = null,
@@ -89,6 +97,8 @@ last_print: ?usize = null,
 failure: ?anyerror = null,
 revision: u64 = 0,
 format_pending: std.ArrayList(u21) = .empty,
+/// Borrowed from Session; standalone screens do not collect history.
+history: ?*History = null,
 
 pub fn init(allocator: std.mem.Allocator, rows: usize, columns: usize) !Screen {
     if (rows == 0 or columns == 0) return error.InvalidDimensions;
@@ -106,6 +116,9 @@ pub fn init(allocator: std.mem.Allocator, rows: usize, columns: usize) !Screen {
     @memset(row_generations, 1);
     const soft_wrapped = try allocator.alloc(bool, rows);
     errdefer allocator.free(soft_wrapped);
+    const wrap_columns = try allocator.alloc(usize, rows);
+    errdefer allocator.free(wrap_columns);
+    @memset(wrap_columns, columns);
     const graphics = try Graphics.init(allocator);
     @memset(soft_wrapped, false);
     @memset(damage_rows, true);
@@ -122,6 +135,7 @@ pub fn init(allocator: std.mem.Allocator, rows: usize, columns: usize) !Screen {
         .tab_stops = tab_stops,
         .scroll_right = columns,
         .soft_wrapped = soft_wrapped,
+        .wrap_columns = wrap_columns,
         .scroll_bottom = rows,
     };
 }
@@ -138,6 +152,7 @@ pub fn deinit(self: *Screen) void {
     self.allocator.free(self.row_generations);
     self.allocator.free(self.tab_stops);
     self.allocator.free(self.soft_wrapped);
+    self.allocator.free(self.wrap_columns);
     self.format_pending.deinit(self.allocator);
     self.* = undefined;
 }
@@ -170,6 +185,10 @@ pub fn resized(self: *const Screen, rows: usize, columns: usize) !Screen {
     replacement.charsets = self.charsets;
     replacement.active_charset = self.active_charset;
     replacement.left_right_mode = self.left_right_mode;
+    replacement.insert_mode = self.insert_mode;
+    replacement.newline_mode = self.newline_mode;
+    replacement.reverse_video = self.reverse_video;
+    replacement.history = self.history;
     @memcpy(replacement.tab_stops[0..@min(columns, self.columns)], self.tab_stops[0..@min(columns, self.columns)]);
     replacement.revision = self.revision +% 1;
     try replacement.format_pending.appendSlice(self.allocator, self.format_pending.items);
@@ -190,7 +209,10 @@ pub fn resized(self: *const Screen, rows: usize, columns: usize) !Screen {
     replacement.saved.row = @min(self.saved.row, rows - 1);
     replacement.saved.column = @min(self.saved.column, columns - 1);
     replacement.saved.wrap_pending = false;
-    if (columns == self.columns) @memcpy(replacement.soft_wrapped[0..@min(rows, self.rows)], self.soft_wrapped[0..@min(rows, self.rows)]);
+    if (columns == self.columns) {
+        @memcpy(replacement.soft_wrapped[0..@min(rows, self.rows)], self.soft_wrapped[0..@min(rows, self.rows)]);
+        @memcpy(replacement.wrap_columns[0..@min(rows, self.rows)], self.wrap_columns[0..@min(rows, self.rows)]);
+    }
     return replacement;
 }
 
@@ -205,6 +227,7 @@ pub fn reset(self: *Screen) void {
     self.graphics.clear();
     @memset(self.cells, .{});
     @memset(self.soft_wrapped, false);
+    @memset(self.wrap_columns, self.columns);
     self.last_print = null;
     self.format_pending.clearRetainingCapacity();
     self.failure = null;
@@ -216,6 +239,9 @@ pub fn reset(self: *Screen) void {
     self.scroll_left = 0;
     self.scroll_right = self.columns;
     self.left_right_mode = false;
+    self.insert_mode = false;
+    self.newline_mode = false;
+    self.reverse_video = false;
     self.charsets = .{ false, false };
     self.active_charset = 0;
     self.repeat_codepoint = null;
@@ -230,6 +256,18 @@ pub fn reset(self: *Screen) void {
 pub fn getCell(self: *const Screen, row: usize, column: usize) ?Cell {
     if (row >= self.rows or column >= self.columns) return null;
     return self.cells[row * self.columns + column];
+}
+/// Copy a borrowed row, retaining grapheme and hyperlink ownership.
+pub fn copyRow(self: *Screen, row: usize, cells: []const Cell, wrapped: bool) !void {
+    const n = @min(self.columns, cells.len);
+    const copy = try History.cloneCells(self.allocator, cells[0..n]);
+    defer self.allocator.free(copy);
+    for (0..self.columns) |col| self.clearCell(row * self.columns + col);
+    @memcpy(self.cells[row * self.columns ..][0..n], copy);
+    if (n > 0 and self.cells[row * self.columns + n - 1].width == 2) self.clearCell(row * self.columns + n - 1);
+    self.soft_wrapped[row] = wrapped;
+    self.wrap_columns[row] = n;
+    self.touch(row);
 }
 
 /// Borrowed target, valid until the cell is overwritten or screen is destroyed.
@@ -376,6 +414,12 @@ fn print(self: *Screen, cp: u21) !void {
             joined[existing.len] = cp;
             var cell = self.cells[at];
             const new_width = if (Unicode.isFormat(cp)) cell.width else Unicode.width(joined);
+            if (self.insert_mode and new_width > cell.width and at % self.columns + new_width <= self.rightEdge()) {
+                const old_column = self.cursor.column;
+                self.cursor.column = at % self.columns + cell.width;
+                self.insertCharacters(new_width - cell.width);
+                self.cursor.column = old_column;
+            }
             self.allocator.free(cell.grapheme);
             cell.grapheme = joined;
             self.cells[at].grapheme = &.{};
@@ -386,6 +430,7 @@ fn print(self: *Screen, cp: u21) !void {
                 self.clearCluster(at);
                 if (self.autowrap and self.rightEdge() - self.leftEdge() > 1) {
                     self.soft_wrapped[self.cursor.row] = true;
+                    self.wrap_columns[self.cursor.row] = at % self.columns;
                     self.cursor.column = self.leftEdge();
                     self.index();
                     target = self.cursor.row * self.columns + self.leftEdge();
@@ -408,6 +453,7 @@ fn print(self: *Screen, cp: u21) !void {
                 return;
             }
             self.cursor.row = target / self.columns;
+            if (self.soft_wrapped[self.cursor.row]) self.wrap_columns[self.cursor.row] = @max(self.wrap_columns[self.cursor.row], target % self.columns + cell.width);
             self.advance(target % self.columns, cell.width);
             self.touch(self.cursor.row);
             return;
@@ -430,11 +476,13 @@ fn print(self: *Screen, cp: u21) !void {
     } else if (width == 0) owned = try self.allocator.dupe(u21, &.{ 0x25cc, cp });
     if (self.wrap_pending or (width == 2 and self.cursor.column == self.rightEdge() - 1 and self.autowrap and self.rightEdge() - self.leftEdge() > 1)) {
         self.soft_wrapped[self.cursor.row] = true;
+        self.wrap_columns[self.cursor.row] = if (self.wrap_pending) self.rightEdge() else self.cursor.column;
         self.cursor.column = self.leftEdge();
         self.index();
     }
     const at = self.cursor.row * self.columns + self.cursor.column;
     const actual: u2 = if (width == 2 and self.cursor.column + 1 < self.rightEdge()) 2 else 1;
+    if (self.insert_mode) self.insertCharacters(actual);
     if (width == 2 and actual == 1) {
         self.allocator.free(owned);
         owned = &.{};
@@ -447,6 +495,7 @@ fn print(self: *Screen, cp: u21) !void {
         self.cells[at + 1] = .{ .codepoint = 0, .width = 0, .style = self.style, .link = if (self.current_link) |link| link.retain() else null };
     }
     self.cells[at] = .{ .codepoint = if (width == 0) 0x25cc else if (width == 2 and actual == 1) 0xfffd else cp, .style = self.style, .width = actual, .grapheme = owned, .link = if (self.current_link) |link| link.retain() else null };
+    if (self.soft_wrapped[self.cursor.row]) self.wrap_columns[self.cursor.row] = @max(self.wrap_columns[self.cursor.row], self.cursor.column + actual);
     self.last_print = at;
     self.touch(self.cursor.row);
     self.advance(at % self.columns, actual);
@@ -470,6 +519,7 @@ fn execute(self: *Screen, control: u8) void {
         },
         0x0a, 0x0b, 0x0c => {
             self.soft_wrapped[self.cursor.row] = false;
+            if (self.newline_mode) self.cursor.column = self.leftEdge();
             self.index();
         },
         0x0d => {
@@ -522,7 +572,9 @@ fn restore(self: *Screen) void {
     const top = if (self.origin_mode) self.scroll_top else 0;
     const bottom = if (self.origin_mode) self.scroll_bottom else self.rows;
     self.cursor.row = std.math.clamp(self.saved.row, top, bottom - 1);
-    self.cursor.column = @min(self.saved.column, self.columns - 1);
+    const left = if (self.origin_mode and self.left_right_mode) self.scroll_left else 0;
+    const right = if (self.origin_mode and self.left_right_mode) self.scroll_right else self.columns;
+    self.cursor.column = std.math.clamp(self.saved.column, left, right - 1);
     self.wrap_pending = self.saved.wrap_pending;
 }
 
@@ -535,8 +587,32 @@ fn countParameter(parameters: []const Parser.Parameter, at: usize) usize {
     return @max(1, parameter(parameters, at, 1));
 }
 
+/// DECSTR resets editing state without erasing text, history, or cursor position.
+pub fn softReset(self: *Screen) void {
+    self.style = .{};
+    self.insert_mode = false;
+    self.newline_mode = false;
+    self.origin_mode = false;
+    self.autowrap = true;
+    self.wrap_pending = false;
+    self.scroll_top = 0;
+    self.scroll_bottom = self.rows;
+    self.scroll_left = 0;
+    self.scroll_right = self.columns;
+    self.left_right_mode = false;
+    self.cursor.visible = true;
+    self.charsets = .{ false, false };
+    self.active_charset = 0;
+    self.saved = .{};
+    self.last_print = null;
+}
+
 fn csi(self: *Screen, command: Parser.Sequence) void {
     const p = command.parameters;
+    if (command.private_prefix == null and std.mem.eql(u8, command.intermediates, "!") and command.final == 'p') {
+        self.softReset();
+        return;
+    }
     if (std.mem.eql(u8, command.intermediates, " ") and command.final == 'q' and command.private_prefix == null) {
         const shape = parameter(p, 0, 0);
         if (p.len <= 1 and shape <= 6) {
@@ -558,6 +634,14 @@ fn csi(self: *Screen, command: Parser.Sequence) void {
             for (p) |item| if (item.separator == .colon) return;
             const enabled = command.final == 'h';
             for (p) |item| switch (item.value orelse 0) {
+                5 => {
+                    self.reverse_video = enabled;
+                    self.invalidateAll();
+                },
+                12 => {
+                    self.cursor.blinking = enabled;
+                    self.cursor.configured = false;
+                },
                 6 => {
                     self.origin_mode = enabled;
                     self.position(1, 1);
@@ -583,6 +667,14 @@ fn csi(self: *Screen, command: Parser.Sequence) void {
         return;
     }
     for (p) |item| if (item.separator == .colon) return;
+    if (command.final == 'h' or command.final == 'l') {
+        for (p) |item| switch (item.value orelse 0) {
+            4 => self.insert_mode = command.final == 'h',
+            20 => self.newline_mode = command.final == 'h',
+            else => {},
+        };
+        return;
+    }
     const n = countParameter(p, 0);
     switch (command.final) {
         'A' => self.moveUp(n),
@@ -707,6 +799,10 @@ fn blank(self: *Screen, start: usize, end: usize) void {
 }
 
 fn eraseDisplay(self: *Screen, mode: u16) void {
+    if (mode == 3) {
+        if (self.history) |history| history.clear();
+        return;
+    }
     if (mode == 2) self.graphics.clear();
     const at = self.cursor.row * self.columns + self.cursor.column;
     switch (mode) {
@@ -770,6 +866,12 @@ fn deleteCharacters(self: *Screen, count: usize) void {
 
 fn scrollUp(self: *Screen, top: usize, bottom: usize, count: usize) void {
     if (self.left_right_mode) return self.scrollRectangle(top, bottom, count, false);
+    if (self.history) |history| if (top == 0 and bottom == self.rows) {
+        for (0..@min(count, bottom - top)) |row| history.push(self.getRow(row).?[0..if (self.soft_wrapped[row]) self.wrap_columns[row] else self.columns], self.soft_wrapped[row]) catch |err| {
+            self.failure = err;
+            return;
+        };
+    };
     self.graphics.scroll(top, bottom, 0, self.columns, -@as(i32, @intCast(@min(count, bottom - top))));
     const start = top * self.columns;
     const end = bottom * self.columns;
@@ -778,6 +880,7 @@ fn scrollUp(self: *Screen, top: usize, bottom: usize, count: usize) void {
     std.mem.copyForwards(Cell, self.cells[start .. end - distance], self.cells[start + distance .. end]);
     const lines = distance / self.columns;
     std.mem.copyForwards(bool, self.soft_wrapped[top .. bottom - lines], self.soft_wrapped[top + lines .. bottom]);
+    std.mem.copyForwards(usize, self.wrap_columns[top .. bottom - lines], self.wrap_columns[top + lines .. bottom]);
     @memset(self.soft_wrapped[bottom - lines .. bottom], false);
     self.touchRange(top, bottom);
     @memset(self.cells[end - distance .. end], .{ .style = self.style });
@@ -793,6 +896,7 @@ fn scrollDown(self: *Screen, top: usize, bottom: usize, count: usize) void {
     std.mem.copyBackwards(Cell, self.cells[start + distance .. end], self.cells[start .. end - distance]);
     const lines = distance / self.columns;
     std.mem.copyBackwards(bool, self.soft_wrapped[top + lines .. bottom], self.soft_wrapped[top .. bottom - lines]);
+    std.mem.copyBackwards(usize, self.wrap_columns[top + lines .. bottom], self.wrap_columns[top .. bottom - lines]);
     @memset(self.soft_wrapped[top .. top + lines], false);
     self.touchRange(top, bottom);
     @memset(self.cells[start .. start + distance], .{ .style = self.style });
@@ -805,7 +909,7 @@ fn sgr(self: *Screen, parameters: []const Parser.Parameter) void {
         var end = i + 1;
         while (end < parameters.len and parameters[end].separator == .colon) : (end += 1) {}
         const value = parameters[i].value orelse 0;
-        if (value == 38 or value == 48) {
+        if (value == 38 or value == 48 or value == 58) {
             const color = if (end > i + 1)
                 colonColor(parameters[i + 1 .. end])
             else color: {
@@ -828,15 +932,22 @@ fn sgr(self: *Screen, parameters: []const Parser.Parameter) void {
                 break :color colonColor(group);
             };
             if (color) |valid| {
-                if (value == 38) self.style.foreground = valid else self.style.background = valid;
+                if (value == 38) self.style.foreground = valid else if (value == 48) self.style.background = valid else self.style.underline_color = valid;
             }
+        } else if (value == 4 and end == i + 2 and parameters[i + 1].value != null and parameters[i + 1].value.? <= 5) {
+            const kind = parameters[i + 1].value.?;
+            self.style.underline = kind != 0;
+            if (kind != 0) self.style.underline_style = @fromBackingInt(@intCast(kind - 1));
         } else if (end == i + 1) {
             switch (value) {
                 0 => self.style = .{},
                 1 => self.style.bold = true,
                 2 => self.style.faint = true,
                 3 => self.style.italic = true,
-                4 => self.style.underline = true,
+                4, 21 => {
+                    self.style.underline = true;
+                    self.style.underline_style = if (value == 21) .double else .single;
+                },
                 5, 6 => self.style.blink = true,
                 7 => self.style.inverse = true,
                 8 => self.style.hidden = true,
@@ -855,6 +966,7 @@ fn sgr(self: *Screen, parameters: []const Parser.Parameter) void {
                 39 => self.style.foreground = .default,
                 40...47 => self.style.background = .{ .indexed = @intCast(value - 40) },
                 49 => self.style.background = .default,
+                59 => self.style.underline_color = .default,
                 90...97 => self.style.foreground = .{ .indexed = @intCast(value - 90 + 8) },
                 100...107 => self.style.background = .{ .indexed = @intCast(value - 100 + 8) },
                 else => {},

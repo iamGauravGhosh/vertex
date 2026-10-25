@@ -76,7 +76,7 @@ contents. Cells contain a `u21` visible base codepoint, a `Style`, width (1 or 2
 0 on continuations), and an immutable borrowed grapheme slice. Use `getGrapheme()`
 for complete text, including combining marks and formatting controls. Cluster
 slices can be invalidated by any event, resize, or deinit; cell copies do not
-own their slices. Unicode 15.1 extended grapheme boundaries and widths replace
+own their slices. Unicode 18.0 extended grapheme boundaries and widths replace
 scalar-per-cell storage. Wide/emoji clusters occupy two columns, ambiguous-width
 characters one. Leading combining marks display a dotted circle. A wide cluster
 on a one-column screen displays a replacement. Blank cells contain a space. Initialization
@@ -162,7 +162,8 @@ eight-column intervals. CSI `b` repeats the preceding printed scalar, with work
 bounded to the cell count per command.
 
 CSI `Ps SP q` selects block (0–2), underline (3–4), or bar (5–6) cursor shapes.
-Blink variants render steadily. Cursor shape affects presentation damage without
+Blink variants set the requested cursor blink state; the GUI schedules blinking.
+Cursor shape affects presentation damage without
 invalidating shaped text.
 
 Mode 69 enables horizontal margins, making CSI `left;right s` set the region
@@ -190,13 +191,20 @@ reset both objects; use `Parser.finish()` to finalize a stream normally.
   27, 28, and 29 respectively. Blink stores a boolean, not a blink speed.
 - Empty SGR, omitted top-level values, and 0 reset the entire style.
 
-SGR only affects subsequent writes and blank fills. Unsupported attribute
-subgroups such as `4:3` are ignored together. Invalid color groups retain the
+SGR only affects subsequent writes and blank fills. Underline subgroups `4:0–5`
+select none/single/double/curly/dotted/dashed; other unsupported subgroups are
+ignored together. Invalid color groups retain the
 previous color and consume their components, including missing values. For
 semicolon colors, mode 5 consumes two following entries and mode 2 consumes
 four; an unknown mode discards the rest of that SGR. Valid later top-level
 attributes still apply after a group with known arity. Mixed colon/semicolon
 components within a color are rejected.
+
+Insert mode (ANSI 4), newline mode (20), reverse video (DEC 5), cursor blink
+(DEC 12), and DEC soft reset are implemented. SGR 4:0–5/21 and 58/59 preserve
+underline style and color independently of text colors. Renderer backends paint
+these decorations. Session's optional history/reflow layer leaves standalone
+`Screen.resize()` fixed-grid behavior unchanged.
 
 Unimplemented sequences, unrelated private prefixes, intermediates, string
 events, and C0 controls other than those listed above are ignored by `Screen`.
@@ -205,8 +213,9 @@ outside SGR are ignored as a whole command. `Screen` generates no replies; use `
 
 ## Limits and validation
 
-The model has no reflow, scrollback, or images. Alternate
-screens are owned by `Session`. Screen storage stays in logical order; visual
+`Screen` keeps a fixed grid with live image placements and can borrow a history
+sink. `Session` owns main/alternate screens, bounded text history, and optional
+main-screen reflow. Screen storage stays in logical order; visual
 bidi ordering and font selection belong to the renderer. The Linux application connects it to Wayland GPU/CPU renderers
 and shell PTY; those dependencies are outside the public terminal module.
 

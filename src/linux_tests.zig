@@ -552,11 +552,12 @@ test "incremental CPU and GPU frames match full redraws through edits cursor scr
     defer damage.deinit();
     var parser = vt.Parser.init();
     const edits = [_][]const u8{
-        "",                                  "ffi ABC\r\nsecond row", "\x1b[1;2H",           "\x1b[?25l",       "\x1b[?25h",
-        "\x1b[1;2H\x1b[31;1;3;4;9mf\x1b[0m", "\x1b[2;3H\x1b[2@XY",    "\x1b[P\x1b[K",        "\x1b[2;4r\x1b[S", "\x1b[T",
-        "\x1b[3;1H\x1b[L",                   "\x1b[M",                "\x1b[44;7mZZ\x1b[0m", "\x1b[2J",         "\x1b[41;8mhidden\x1b[0m",
-        "\x1b[1;1H\xf4\x8f\xbf\xbf",         "\x1bc",
+        "",                                                "ffi ABC\r\nsecond row",                  "\x1b[1;2H",                                  "\x1b[?25l",       "\x1b[?25h",
+        "\x1b[1;2H\x1b[31;1;3;4;9mf\x1b[0m",               "\x1b[2;3H\x1b[2@XY",                     "\x1b[P\x1b[K",                               "\x1b[2;4r\x1b[S", "\x1b[T",
+        "\x1b[3;1H\x1b[L",                                 "\x1b[M",                                 "\x1b[44;7mZZ\x1b[0m",                        "\x1b[2J",         "\x1b[41;8mhidden\x1b[0m",
+        "\x1b[1;1H\xf4\x8f\xbf\xbf",                       "\x1bc",
         "\x1b[38;2;1;127;254;48:2::3:5:7m界e\xcc\x81👩‍💻🇮🇳",
+        "\x1b[1;1H\x1b[4:2;58:2::255:70:90mDOUBLE\x1b[0m", "\x1b[2;1H\x1b[4:3;58;5;11mCURLY\x1b[0m", "\x1b[3;1H\x1b[4:4mDOTS\x1b[4:5mDASH\x1b[0m", "\x1b[?5h",        "\x1b[?5l",
     };
     for (edits) |edit| {
         parser.feed(edit, &screen);

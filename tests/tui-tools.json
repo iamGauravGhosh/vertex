@@ -1,0 +1,6 @@
+{
+  "nvim": {"version":"0.12.6","url":"https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-x86_64.tar.gz","sha256":"474430d53e6264f6d6dd18db42d6dc9df3a1b56ca9e88a325bbf860e1a811d87","binary":"nvim-linux-x86_64/bin/nvim"},
+  "hx": {"version":"25.07.1","url":"https://github.com/helix-editor/helix/releases/download/25.07.1/helix-25.07.1-x86_64-linux.tar.xz","sha256":"3f08e63ecd388fff657ad39722f88bb03dcf326f1f2da2700d99e1dc40ab2e8b","binary":"helix-25.07.1-x86_64-linux/hx"},
+  "lazygit": {"version":"0.66.2","url":"https://github.com/jesseduffield/lazygit/releases/download/v0.66.2/lazygit_0.66.2_linux_x86_64.tar.gz","sha256":"158efc9ddfa1241fab5fb3526bb442c8dc6c4b1904d73213b9e4e93e03c52034","binary":"lazygit"},
+  "lazydocker": {"version":"0.25.2","url":"https://github.com/jesseduffield/lazydocker/releases/download/v0.25.2/lazydocker_0.25.2_Linux_x86_64.tar.gz","sha256":"0d9dbfc26068b218e7ed84b104748cadc6e3cf733c0afd35465306fb39b9523c","binary":"lazydocker"}
+}

@@ -85,6 +85,7 @@ metrics: std.AutoHashMap(u64, Metrics),
 rows: []Row = &.{},
 shaped_rows: usize = 0,
 hover: ?vt.Links.Range = null,
+reverse_video: bool = false,
 levels_scratch: std.ArrayList(c.FriBidiLevel) = .empty,
 scripts_scratch: std.ArrayList(c.hb_script_t) = .empty,
 font_cache: std.AutoHashMapUnmanaged(u32, usize) = .empty,
@@ -698,7 +699,7 @@ fn load(self: *Renderer, face_index: usize, id: u32, style: vt.Style) !Metrics {
 
 pub fn background(self: *const Renderer) u32 {
     const alpha: u8 = @intFromFloat(@round(self.background_opacity * 255));
-    return premultiply(self.theme.background, alpha);
+    return premultiply(if (self.reverse_video) self.theme.foreground else self.theme.background, alpha);
 }
 pub fn premultiply(rgb: u32, alpha: u8) u32 {
     var result = @as(u32, alpha) << 24;
@@ -715,9 +716,9 @@ fn themedColor(self: *const Renderer, value: vt.Color, fallback: u32, bold: bool
 fn colors(self: *const Renderer, style: vt.Style, cursor: bool) struct { fg: u32, bg: u32 } {
     var fg = self.themedColor(style.foreground, self.theme.foreground, style.bold);
     var bg = self.themedColor(style.background, self.theme.background, false);
-    if (style.inverse) std.mem.swap(u32, &fg, &bg);
+    if (style.inverse != self.reverse_video) std.mem.swap(u32, &fg, &bg);
     if (style.faint) fg = blend(fg, bg, @intFromFloat(@round(self.theme.dim_factor * 255)));
-    const transparent = style.background == .default and !style.inverse;
+    const transparent = !style.inverse and (if (self.reverse_video) style.foreground == .default else style.background == .default);
     if (cursor) return .{ .fg = 0xff000000 | (self.theme.cursor_text orelse bg), .bg = 0xff000000 | (self.theme.cursor orelse fg) };
     return .{ .fg = 0xff000000 | fg, .bg = if (transparent) self.background() else 0xff000000 | bg };
 }
@@ -768,6 +769,7 @@ fn Viewport(comptime T: type) type {
 
 /// Shared draw traversal; painters provide fill, mask, upload, and flush.
 fn paintGrid(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, painter: anytype) !void {
+    self.reverse_video = screen.reverse_video;
     const cw = self.cell_width * self.scale;
     const ch = self.cell_height * self.scale;
     var cursor = screen.getCursor();
@@ -850,7 +852,21 @@ fn paintGrid(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
             const hovered = if (self.hover) |range| row * screen.columns + col >= range.first and row * screen.columns + col < range.end else false;
             if (cell.style.underline or hovered) {
                 const line = @min(ch - 1, (baseline + 1) * self.scale);
-                try painter.fill(.{ .x = x, .y = y + @as(i32, @intCast(line)), .width = @intCast(cw), .height = @intCast(@min(self.scale, ch - line)) }, rgb.fg);
+                const decoration_color = if (cell.style.underline) 0xff000000 | self.themedColor(cell.style.underline_color, rgb.fg & 0xffffff, false) else rgb.fg;
+                const kind = if (cell.style.underline) cell.style.underline_style else .single;
+                const thickness = @min(self.scale, ch);
+                if (kind == .single or kind == .double) {
+                    const at = @min(ch - thickness, line);
+                    try painter.fill(.{ .x = x, .y = y + @as(i32, @intCast(at)), .width = @intCast(cw), .height = @intCast(thickness) }, decoration_color);
+                    if (kind == .double and at >= 2 * self.scale) try painter.fill(.{ .x = x, .y = y + @as(i32, @intCast(at - 2 * self.scale)), .width = @intCast(cw), .height = @intCast(thickness) }, decoration_color);
+                } else for (0..cw) |pixel| {
+                    const logical = (col * cw + pixel) / self.scale;
+                    if (kind == .dotted and logical % 3 != 0) continue;
+                    if (kind == .dashed and logical % 6 >= 4) continue;
+                    const offset = if (kind == .curly) (if (logical % 4 < 2) @as(usize, 0) else self.scale) else 0;
+                    const at = @min(ch - thickness, line -| offset);
+                    try painter.fill(.{ .x = x + @as(i32, @intCast(pixel)), .y = y + @as(i32, @intCast(at)), .width = 1, .height = @intCast(thickness) }, decoration_color);
+                }
             }
             if (cell.style.strikethrough) {
                 const line = @min(ch - 1, baseline / 2 * self.scale);
@@ -937,11 +953,16 @@ fn paintImages(self: *Renderer, screen: *const vt.Screen, row: usize, layer: u2,
 
 pub fn drawRows(self: *Renderer, screen: *const vt.Screen, pixels: []u32, width: usize, height: usize, dirty: []const bool) !void {
     std.debug.assert(pixels.len == width * height);
+    if (self.reverse_video != screen.reverse_video) {
+        self.reverse_video = screen.reverse_video;
+        @memset(pixels, self.background());
+    }
     var painter: Cpu = .{ .pixels = pixels, .width = width, .height = height };
     try self.paint(screen, dirty, &painter);
 }
 
 pub fn draw(self: *Renderer, screen: *const vt.Screen, pixels: []u32, width: usize, height: usize) !void {
+    self.reverse_video = screen.reverse_video;
     @memset(pixels, self.background());
     const dirty = try self.allocator.alloc(bool, screen.rows);
     defer self.allocator.free(dirty);

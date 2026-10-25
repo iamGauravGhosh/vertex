@@ -94,7 +94,7 @@ pub fn runWithOptions(allocator: std.mem.Allocator, options: Launch) !u8 {
         .damage = Renderer.Damage.init(allocator),
     };
     defer app.deinit();
-    app.session = try vt.Session.initWithOptions(allocator, app.settings.window.rows, app.settings.window.columns, .{ .images = true, .decoder = ImageDecoder.decode });
+    app.session = try vt.Session.initWithOptions(allocator, app.settings.window.rows, app.settings.window.columns, .{ .images = true, .decoder = ImageDecoder.decode, .history = true, .history_lines = app.settings.terminal.scrollback_lines, .history_bytes = app.settings.terminal.scrollback_bytes, .reflow = app.settings.terminal.reflow });
     app.screen = app.session.activeScreen();
     app.screen_ready = true;
     app.applyPresentation();
@@ -114,7 +114,7 @@ const App = struct {
     blink_start: i64 = 0,
     blink_cursor: ?vt.Cursor = null,
     cursor_deadline: ?i64 = null,
-    consumed_keys: [256]?Config.Action = @splat(null),
+    consumed_keys: [1024]?Config.Action = @splat(null),
     fullscreen: bool = false,
     pointer_serial: u32 = 0,
     pointer_hidden: bool = false,
@@ -172,7 +172,8 @@ const App = struct {
     repeat_delay: i32 = 0,
     repeat_key: ?u32 = null,
     composed_symbol: u32 = 0,
-    pressed: [256]?vt.Input.Key = @splat(null),
+    // Covers Linux's extended evdev key range, including external macro keys.
+    pressed: [1024]?vt.Input.Key = @splat(null),
     physical_down: [256]bool = @splat(false),
     composed_text: [96]u8 = undefined,
     composed_length: usize = 0,
@@ -190,10 +191,20 @@ const App = struct {
     size_changed: bool = true,
     closing: bool = false,
     failure: ?anyerror = null,
+    color_generation: u64 = 0,
+    bell_until: ?i64 = null,
+    selecting: bool = false,
+    selection_anchor: vt.Session.Position = .{ .row = 0, .column = 0 },
+    selection_clicks: u8 = 0,
+    selection_click_ms: i64 = 0,
+    selection_click_at: vt.Session.Position = .{ .row = 0, .column = 0 },
 
     fn applyPresentation(self: *App) void {
-        self.renderer.theme = self.settings.colors;
-        self.session.theme = self.settings.colors;
+        self.session.setTheme(self.settings.colors);
+        self.renderer.theme = self.session.theme;
+        self.color_generation = self.session.color_generation;
+        self.session.reflow = self.settings.terminal.reflow;
+        self.session.setHistoryLimits(self.settings.terminal.scrollback_lines, self.settings.terminal.scrollback_bytes);
         self.session.setCursorDefaults(self.settings.cursor.shape, self.settings.cursor.blinking);
         self.renderer.bidi = self.settings.terminal.bidi == .auto;
         self.renderer.background_opacity = if (self.focused) self.settings.window.opacity else self.settings.window.unfocused_opacity orelse self.settings.window.opacity;
@@ -277,6 +288,10 @@ const App = struct {
     }
     fn performAction(self: *App, binding: Config.Binding) !void {
         switch (binding.action) {
+            .copy => if (self.session.selection != null) {
+                self.clipboard.set(try self.session.copySelection(self.allocator));
+            },
+            .scroll_page_up, .scroll_page_down => self.session.scroll(@as(i32, @intCast(@max(1, self.screen.rows -| 1))) * @as(i32, if (binding.action == .scroll_page_up) 1 else -1)),
             .paste, .paste_primary => try self.clipboard.request(binding.action == .paste_primary),
             .reload => self.reload_requested = true,
             .fullscreen => {
@@ -382,6 +397,7 @@ const App = struct {
             const cursor = self.screen.getCursor();
             if (self.ime.preedit.len == 0) self.ime.cursor(@intCast(self.content_x + (try self.renderer.visualColumn(self.screen, cursor.row, cursor.column)) * self.renderer.cell_width), @intCast(self.content_y + cursor.row * self.renderer.cell_height), @intCast(self.renderer.cell_width), @intCast(self.renderer.cell_height));
             if (self.ime.committed.items.len != 0) {
+                self.session.live();
                 if (self.session.getModes().kitty & 8 != 0) {
                     const encoded = try self.allocator.alloc(u8, self.ime.committed.items.len * 12 + 32);
                     defer self.allocator.free(encoded);
@@ -438,6 +454,7 @@ const App = struct {
             if (self.session.sync_deadline_ms) |deadline| timeout = @intCast(std.math.clamp(deadline - common.milliseconds(), 0, timeout));
             if (self.watch.deadline) |deadline| timeout = @min(timeout, @as(c_int, @intCast(std.math.clamp(deadline - common.milliseconds(), 0, 100))));
             if (self.cursor_deadline) |deadline| timeout = @min(timeout, @as(c_int, @intCast(std.math.clamp(deadline - common.milliseconds(), 0, 100))));
+            if (self.bell_until) |deadline| timeout = @min(timeout, @as(c_int, @intCast(std.math.clamp(deadline - common.milliseconds(), 0, 100))));
             const result = c.poll(&fds, fds.len, timeout);
             if (result < 0) {
                 if (common.errno() == c.EINTR) continue;
@@ -459,6 +476,7 @@ const App = struct {
                     break :blk null;
                 };
                 if (received) |text| {
+                    self.session.live();
                     defer self.allocator.free(text);
                     const transaction = try vt.Input.paste(self.allocator, text, self.session.modes.bracketed_paste);
                     defer self.allocator.free(transaction);
@@ -572,6 +590,19 @@ const App = struct {
 
     fn draw(self: *App) !void {
         self.collectBuffers();
+        if (self.session.takeBell() and self.settings.terminal.visual_bell > 0) {
+            self.bell_until = common.milliseconds() + self.settings.terminal.visual_bell;
+            self.screen.invalidateAll();
+        }
+        if (self.bell_until) |deadline| if (common.milliseconds() >= deadline) {
+            self.bell_until = null;
+            self.screen.invalidateAll();
+        };
+        if (self.color_generation != self.session.color_generation) {
+            self.renderer.theme = self.session.theme;
+            self.color_generation = self.session.color_generation;
+            self.damage.?.invalidate();
+        }
         if (self.frame != null or self.session.presentationHeld(common.milliseconds())) return;
         if (self.renderer.bidi) {
             for (self.screen.getDamageRows()) |dirty| if (dirty) {
@@ -582,7 +613,14 @@ const App = struct {
         var overlay: ?vt.Screen = null;
         defer if (overlay) |*screen| screen.deinit();
         var displayed = self.screen;
-        if (self.ime.preedit.len != 0) {
+        if (self.session.scroll_offset != 0 or self.session.selection != null or self.bell_until != null) {
+            overlay = try self.session.viewport();
+            displayed = &overlay.?;
+            if (self.bell_until != null) displayed.reverse_video = !displayed.reverse_video;
+            @memcpy(displayed.damage_rows, self.screen.getDamageRows());
+        }
+        self.renderer.reverse_video = displayed.reverse_video;
+        if (self.ime.preedit.len != 0 and overlay == null) {
             overlay = try self.screen.resized(self.screen.rows, self.screen.columns);
             displayed = &overlay.?;
             displayed.wrap_pending = self.screen.wrap_pending;
@@ -675,6 +713,12 @@ const App = struct {
         const col: usize = @intFromFloat(@floor((self.pointer_x - @as(f64, @floatFromInt(self.content_x))) / @as(f64, @floatFromInt(self.renderer.cell_width))));
         const row: usize = @intFromFloat(@floor((self.pointer_y - @as(f64, @floatFromInt(self.content_y))) / @as(f64, @floatFromInt(self.renderer.cell_height))));
         if (row >= self.screen.rows or col >= self.screen.columns) return null;
+        if (self.session.scroll_offset != 0) {
+            var view = try self.session.viewport();
+            defer view.deinit();
+            const logical = try self.renderer.logicalColumn(&view, row, col);
+            return vt.Links.find(self.allocator, &view, row, logical);
+        }
         const logical = try self.renderer.logicalColumn(self.screen, row, col);
         return vt.Links.find(self.allocator, self.screen, row, logical);
     }
@@ -752,7 +796,7 @@ const App = struct {
         if (!self.focused or self.key_state == null) return false;
         if (key < self.consumed_keys.len) if (self.consumed_keys[key]) |consumed| {
             if (action == .release) self.consumed_keys[key] = null;
-            if (action == .repeat and (consumed == .font_increase or consumed == .font_decrease or consumed == .opacity_increase or consumed == .opacity_decrease)) {
+            if (action == .repeat and (consumed == .font_increase or consumed == .font_decrease or consumed == .opacity_increase or consumed == .opacity_decrease or consumed == .scroll_page_up or consumed == .scroll_page_down)) {
                 try self.performAction(.{ .action = consumed });
                 return true;
             }
@@ -763,13 +807,18 @@ const App = struct {
         if (action == .press) {
             self.blink_start = common.milliseconds();
             const symbol = c.xkb_state_key_get_one_sym(state, key);
+            if (symbol == c.XKB_KEY_Escape and self.session.selection != null) {
+                self.session.live();
+                if (key < self.consumed_keys.len) self.consumed_keys[key] = .ignore;
+                return false;
+            }
             const mask = Config.modifierBits(self.modifiers());
             for (self.settings.keyboard.bindings) |binding| {
                 if (c.xkb_keysym_to_lower(symbol) != c.xkb_keysym_to_lower(Config.keySymbol(binding.key)) or mask != try Config.parseModifiers(binding.mods)) continue;
                 if (binding.action == .none) break;
                 if (key < self.consumed_keys.len) self.consumed_keys[key] = binding.action;
                 try self.performAction(binding);
-                return binding.action == .font_increase or binding.action == .font_decrease or binding.action == .opacity_increase or binding.action == .opacity_decrease;
+                return binding.action == .font_increase or binding.action == .font_decrease or binding.action == .opacity_increase or binding.action == .opacity_decrease or binding.action == .scroll_page_up or binding.action == .scroll_page_down;
             }
         }
         var symbol = c.xkb_state_key_get_one_sym(state, key);
@@ -839,6 +888,7 @@ const App = struct {
             self.pressed[key] = null;
         }
         const bytes = try input.encodeKey(&encoded, event, self.session.getModes());
+        if (action != .release and bytes.len > 0) self.session.live();
         if (action == .press and bytes.len != 0 and key < self.pressed.len) {
             event.text = "";
             self.pressed[key] = event;
@@ -1251,6 +1301,7 @@ fn pointerLeave(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: ?*c.wl_surface)
     self.pointer_inside = false;
     self.pointer_hidden = false;
     self.pointer_buttons = 0;
+    self.selecting = false;
     self.link_click = false;
     self.paste_click = null;
     self.pointer_last = null;
@@ -1261,8 +1312,21 @@ fn pointerMotion(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, x: c.wl_fixed_t, 
     self.showPointer();
     self.pointer_x = @as(f64, @floatFromInt(x)) / 256;
     self.pointer_y = @as(f64, @floatFromInt(y)) / 256;
+    if (self.selecting) {
+        var at = selectionPoint(self);
+        if (at.row > self.selection_anchor.row or (at.row == self.selection_anchor.row and at.column >= self.selection_anchor.column)) at.column = @min(self.screen.columns, at.column + 1);
+        self.session.select(self.selection_anchor, at);
+        return;
+    }
     const button: u8 = if (self.pointer_buttons & 1 != 0) 0 else if (self.pointer_buttons & 2 != 0) 1 else if (self.pointer_buttons & 4 != 0) 2 else 3;
     sendPointer(self, .motion, button);
+}
+fn selectionPoint(self: *const App) vt.Session.Position {
+    const x = @max(0, self.pointer_x - @as(f64, @floatFromInt(self.content_x)));
+    const y = @max(0, self.pointer_y - @as(f64, @floatFromInt(self.content_y)));
+    const col: usize = @intFromFloat(@min(@as(f64, @floatFromInt(self.screen.columns - 1)), @floor(x / @as(f64, @floatFromInt(self.renderer.cell_width)))));
+    const row: usize = @intFromFloat(@min(@as(f64, @floatFromInt(self.screen.rows - 1)), @floor(y / @as(f64, @floatFromInt(self.renderer.cell_height)))));
+    return self.session.point(row, col);
 }
 fn pointerButton(data: ?*anyopaque, _: ?*c.wl_pointer, serial: u32, _: u32, button: u32, state: u32) callconv(.c) void {
     const self = appFrom(data);
@@ -1276,6 +1340,17 @@ fn pointerButton(data: ?*anyopaque, _: ?*c.wl_pointer, serial: u32, _: u32, butt
     if (pressed) self.clipboard.serial = serial;
     const bit = @as(u8, 1) << @intCast(number);
     if (pressed) self.pointer_buttons |= bit else self.pointer_buttons &= ~bit;
+    if (!pressed and number == 0 and self.selecting) {
+        self.selecting = false;
+        if (self.session.selection != null) {
+            const text = self.session.copySelection(self.allocator) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.clipboard.setPrimary(text);
+        }
+        return;
+    }
     if (!pressed and self.paste_click != null and self.paste_click.? == number) {
         self.paste_click = null;
         return;
@@ -1307,6 +1382,17 @@ fn pointerButton(data: ?*anyopaque, _: ?*c.wl_pointer, serial: u32, _: u32, butt
             }
         }
     }
+    if (number == 0 and pressed and self.screen_ready and (self.session.modes.mouse_tracking == 0 or Config.modifierHeld(self.settings.mouse.reporting_bypass, self.modifiers()))) {
+        const at = selectionPoint(self);
+        const now = common.milliseconds();
+        self.selection_clicks = if (now - self.selection_click_ms < 400 and std.meta.eql(at, self.selection_click_at)) self.selection_clicks % 3 + 1 else 1;
+        self.selection_click_ms = now;
+        self.selection_click_at = at;
+        self.selection_anchor = at;
+        self.selecting = true;
+        if (self.selection_clicks > 1) self.session.selectWord(at, self.selection_clicks == 3) else self.session.select(at, at);
+        return;
+    }
     if (paste_button != null and number == paste_button.? and pressed and (self.session.modes.mouse_tracking == 0 or Config.modifierHeld(self.settings.mouse.reporting_bypass, self.modifiers()))) {
         self.paste_click = number;
         self.clipboard.request(self.settings.mouse.paste_primary) catch |err| {
@@ -1326,6 +1412,17 @@ fn pointerFrame(data: ?*anyopaque, _: ?*c.wl_pointer) callconv(.c) void {
         self.axes[axis] += (if (self.axis_discrete[axis] != 0) @as(f64, @floatFromInt(self.axis_discrete[axis])) else self.axis_values[axis]) * self.settings.mouse.wheel_multiplier;
         const steps: i32 = @intFromFloat(std.math.clamp(@trunc(self.axes[axis]), -128, 128));
         self.axes[axis] -= @as(f64, @floatFromInt(steps));
+        if (axis == 0 and (self.session.modes.mouse_tracking == 0 or Config.modifierHeld(self.settings.mouse.reporting_bypass, self.modifiers()))) {
+            if (self.session.alternate and self.session.modes.alternate_scroll and !Config.modifierHeld(self.settings.mouse.reporting_bypass, self.modifiers())) {
+                for (0..@intCast(@abs(steps))) |_| {
+                    var buf: [128]u8 = undefined;
+                    self.queue(vt.Input.encodeKey(&buf, .{ .code = if (steps < 0) 57352 else 57353 }, self.session.getModes()) catch continue) catch |err| {
+                        self.failure = err;
+                    };
+                }
+            } else self.session.scroll(-steps * 3);
+            continue;
+        }
         for (0..@intCast(@abs(steps))) |_| sendPointer(self, .wheel, if (axis == 0) (if (steps < 0) 64 else 65) else (if (steps < 0) 66 else 67));
     }
     self.axis_values = @splat(0);
@@ -1613,6 +1710,92 @@ test "local shortcuts consume repeats and releases without leaking Kitty events"
     _ = try app.sendKey(key, .release);
     try t.expect(std.mem.indexOf(u8, app.pending.items, ":3") != null);
     try t.expect(app.pressed[key] == null and app.consumed_keys[key] == null);
+}
+
+test "native XKB preserves modern modifiers AltGr and composed text" {
+    const t = std.testing;
+    var app: App = .{ .allocator = t.allocator, .renderer = try Renderer.init(t.allocator), .screen = undefined, .session = try vt.Session.init(t.allocator, 2, 20), .focused = true };
+    app.screen = app.session.activeScreen();
+    app.screen_ready = true;
+    app.settings.keyboard.bindings = &.{};
+    defer app.deinit();
+    app.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbFailed;
+    var names = std.mem.zeroes(c.xkb_rule_names);
+    names.layout = "us";
+    app.keymap = c.xkb_keymap_new_from_names(app.xkb_context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbFailed;
+    app.key_state = c.xkb_state_new(app.keymap) orelse return error.XkbFailed;
+    var parser = vt.Parser.init();
+    parser.feed("\x1b[>1u", &app.session);
+    const cases = .{
+        .{ "RTRN", "Shift", "\x1b[13;2u" },
+        .{ "RTRN", "Control", "\x1b[13;5u" },
+        .{ "TAB", "Control", "\x1b[9;5u" },
+        .{ "AC01", "Mod4", "\x1b[97;9u" },
+    };
+    inline for (cases) |case| {
+        const modifier = c.xkb_keymap_mod_get_index(app.keymap, case[1]);
+        _ = c.xkb_state_update_mask(app.key_state, @as(u32, 1) << @intCast(modifier), 0, 0, 0, 0, 0);
+        const key_ = c.xkb_keymap_key_by_name(app.keymap, case[0]);
+        app.pending.clearRetainingCapacity();
+        _ = try app.sendKey(key_, .press);
+        try t.expectEqualStrings(case[2], app.pending.items);
+        _ = try app.sendKey(key_, .release);
+    }
+    c.xkb_state_unref(app.key_state);
+    c.xkb_keymap_unref(app.keymap);
+    names.layout = "de";
+    app.keymap = c.xkb_keymap_new_from_names(app.xkb_context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbFailed;
+    app.key_state = c.xkb_state_new(app.keymap) orelse return error.XkbFailed;
+    parser.feed("\x1b[<u", &app.session);
+    _ = c.xkb_state_update_mask(app.key_state, @as(u32, 1) << @intCast(c.xkb_keymap_mod_get_index(app.keymap, "Mod5")), 0, 0, 0, 0, 0);
+    app.pending.clearRetainingCapacity();
+    _ = try app.sendKey(c.xkb_keymap_key_by_name(app.keymap, "AD01"), .press);
+    try t.expectEqualStrings("@", app.pending.items);
+    c.xkb_state_unref(app.key_state);
+    c.xkb_keymap_unref(app.keymap);
+    names.layout = "us";
+    names.variant = "intl";
+    app.keymap = c.xkb_keymap_new_from_names(app.xkb_context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbFailed;
+    app.key_state = c.xkb_state_new(app.keymap) orelse return error.XkbFailed;
+    app.compose_table = c.xkb_compose_table_new_from_locale(app.xkb_context, "C.UTF-8", c.XKB_COMPOSE_COMPILE_NO_FLAGS) orelse return error.XkbFailed;
+    app.compose_state = c.xkb_compose_state_new(app.compose_table, c.XKB_COMPOSE_STATE_NO_FLAGS) orelse return error.XkbFailed;
+    app.pending.clearRetainingCapacity();
+    _ = try app.sendKey(c.xkb_keymap_key_by_name(app.keymap, "AC11"), .press);
+    _ = try app.sendKey(c.xkb_keymap_key_by_name(app.keymap, "AD03"), .press);
+    try t.expectEqualStrings("é", app.pending.items);
+    c.xkb_state_unref(app.key_state);
+    c.xkb_keymap_unref(app.keymap);
+    const extended = "xkb_keymap { xkb_keycodes { minimum=8; maximum=700; <TEST>=600; }; xkb_types { include \"complete\" }; xkb_compatibility { include \"complete\" }; xkb_symbols { key <TEST> { [ Escape ] }; }; };";
+    app.keymap = c.xkb_keymap_new_from_string(app.xkb_context, extended, c.XKB_KEYMAP_FORMAT_TEXT_V1, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbFailed;
+    app.key_state = c.xkb_state_new(app.keymap) orelse return error.XkbFailed;
+    parser.feed("\x1b[>3u", &app.session);
+    app.pending.clearRetainingCapacity();
+    _ = try app.sendKey(600, .press);
+    _ = try app.sendKey(600, .release);
+    try t.expectEqualStrings("\x1b[27;1:1u\x1b[27;1:3u", app.pending.items);
+}
+
+test "native drag selection copies text and scroll bypass preserves application mouse" {
+    const t = std.testing;
+    var app: App = .{ .allocator = t.allocator, .clipboard = .{ .allocator = t.allocator }, .renderer = try Renderer.init(t.allocator), .screen = undefined, .session = try vt.Session.initWithOptions(t.allocator, 3, 20, .{ .history_lines = 20 }), .focused = true, .pointer_inside = true };
+    app.screen = app.session.activeScreen();
+    app.screen_ready = true;
+    defer app.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("hello world\r\nsecond\r\nthird\r\nfourth", &app.session);
+    app.session.scroll(1);
+    pointerButton(&app, null, 1, 0, 0x110, c.WL_POINTER_BUTTON_STATE_PRESSED);
+    pointerMotion(&app, null, 0, @intCast(app.renderer.cell_width * 4 * 256), 0);
+    pointerButton(&app, null, 2, 0, 0x110, c.WL_POINTER_BUTTON_STATE_RELEASED);
+    try t.expectEqualStrings("hello", app.clipboard.primary_outgoing.?);
+    try app.performAction(.{ .action = .copy });
+    try t.expectEqualStrings("hello", app.clipboard.outgoing.?);
+    app.session.modes.mouse_tracking = 1000;
+    app.session.modes.mouse_sgr = true;
+    app.pending.clearRetainingCapacity();
+    app.axis_discrete[0] = 1;
+    pointerFrame(&app, null);
+    try t.expect(std.mem.indexOf(u8, app.pending.items, "[<65;") != null);
 }
 
 test "reload preserves the PTY and existing content and rolls back invalid snapshots" {

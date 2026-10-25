@@ -81,7 +81,9 @@ settings and keybindings reload live. Shell, working directory, environment,
 renderer backend, app ID, startup dimensions/mode and decorations affect new
 windows; changing these prints a notice. Reload resets temporary font/opacity
 adjustments made through shortcuts to the saved configuration. Reload does not
-restart the PTY; resizing preserves the screen's top-left overlap without reflow.
+restart the PTY. Main-screen text/history reflow and history limits also reload
+live; alternate screens retain fixed-grid resizing. See the
+[compatibility guide](compatibility.md) for scrollback, copy and editor settings.
 
 ## Settings reference
 
@@ -165,6 +167,6 @@ profile. Vertex does not modify your compositor configuration.
 Set transparency in Vertex to keep text opaque. Compositor-wide window opacity
 also fades text and images. Blur, borders, corner radii, shadows, gaps and
 placement are compositor settings; enable and tune them there. Vertex does not
-request native blur. Fractional-scale protocols, background images, scrollback,
-selection/copy UI, tabs/panes, and Kitty extensions are outside this change;
+request native blur. Fractional-scale protocols, background images and tabs/panes
+remain outside the configuration system's responsibilities;
 multiplexers remain the source of tabs and panes.

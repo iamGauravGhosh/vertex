@@ -18,7 +18,7 @@ test "TOML defaults round trip through owned configuration" {
     try t.expect(!config.value.font.ligatures);
     try t.expectEqual(@as(f64, 12), config.value.font.size);
     try t.expectEqual(@as(u32, 0x15171a), config.value.colors.background);
-    try t.expectEqual(@as(usize, 2), config.value.keyboard.bindings.len);
+    try t.expectEqual(@as(usize, 5), config.value.keyboard.bindings.len);
     try t.expectEqual(@as(u16, 80), config.value.window.columns);
 }
 test "TOML syntax features nested values and color overrides" {

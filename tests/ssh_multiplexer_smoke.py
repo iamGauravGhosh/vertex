@@ -17,6 +17,8 @@ def main():
     parser.add_argument("--test-driver", action="store_true")
     parser.add_argument("--require-multiplexers", action="store_true")
     parser.add_argument("--tools-dir", type=Path)
+    parser.add_argument("--tui-only", action="store_true")
+    parser.add_argument("--tui-apps", nargs="+", default=[])
     args = parser.parse_args()
     sshd = shutil.which("sshd")
     if not sshd:
@@ -64,7 +66,16 @@ def main():
                     command.append("--require-multiplexers")
                 if args.tools_dir:
                     command.extend(["--tools-dir", str(args.tools_dir)])
-                subprocess.run(command, check=True, timeout=180)
+                if not args.tui_only:
+                    subprocess.run(command, check=True, timeout=180)
+                if args.tui_apps:
+                    tui = [sys.executable, str(Path(__file__).with_name("tui_smoke.py")), str(args.host),
+                           "--ssh-prefix", json.dumps(prefix), "--require-apps", "--apps", *args.tui_apps]
+                    if args.test_driver:
+                        tui.append("--test-driver")
+                    if args.tools_dir:
+                        tui.extend(["--tools-dir", str(args.tools_dir)])
+                    subprocess.run(tui, check=True, timeout=180)
             finally:
                 server.terminate()
                 try:

@@ -1,0 +1,88 @@
+name: Application compatibility
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: '19 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  applications:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      LIBGL_ALWAYS_SOFTWARE: '1'
+      VERTEX_TEST_GPU: '1'
+      VERTEX_TEST_ARTIFACTS: ${{ github.workspace }}/compatibility-artifacts/run
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.17.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+          cache: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.13'
+      - name: Install native test dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev wayland-protocols libxkbcommon-dev libfreetype-dev libfontconfig1-dev libharfbuzz-dev libfribidi-dev libegl1-mesa-dev libgles2-mesa-dev libwayland-egl-backend-dev libgl1-mesa-dri fonts-dejavu-core vim emacs-nox tmux busybox-static ncurses-term openssh-server
+      - name: Install pinned application binaries
+        run: |
+          python3 tools/install_test_tuis.py "$RUNNER_TEMP/vertex-tui-tools"
+          python3 tools/install_test_multiplexers.py "$RUNNER_TEMP/vertex-tui-tools"
+          echo "$RUNNER_TEMP/vertex-tui-tools" >> "$GITHUB_PATH"
+      - name: Install locked agent and framework fixtures
+        working-directory: tests/tui-fixtures
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          node prepare.mjs
+          uv sync --frozen --python 3.12
+          echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Compile the Bubble Tea fixture
+        working-directory: tests/tui-fixtures/bubbletea
+        run: go build -mod=readonly -o "$RUNNER_TEMP/vertex-tui-tools/vertex-bubbletea-fixture" .
+      - name: Prepare isolated LazyVim
+        run: |
+          python3 tools/prepare_lazyvim_fixture.py "$RUNNER_TEMP/vertex-lazyvim"
+          echo "VERTEX_TEST_LAZYVIM_FIXTURE=$RUNNER_TEMP/vertex-lazyvim" >> "$GITHUB_ENV"
+      - name: Start a private Docker daemon
+        run: |
+          sudo dockerd --host="unix://$RUNNER_TEMP/vertex-docker.sock" --data-root="$RUNNER_TEMP/vertex-docker-data" --exec-root="$RUNNER_TEMP/vertex-docker-exec" --pidfile="$RUNNER_TEMP/vertex-docker.pid" --bridge=none --iptables=false > "$RUNNER_TEMP/vertex-docker.log" 2>&1 &
+          for attempt in $(seq 1 60); do
+            if sudo docker --host="unix://$RUNNER_TEMP/vertex-docker.sock" info >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          sudo chmod 666 "$RUNNER_TEMP/vertex-docker.sock"
+          python3 tests/docker_fixture.py "unix://$RUNNER_TEMP/vertex-docker.sock"
+          echo "VERTEX_TEST_DOCKER_HOST=unix://$RUNNER_TEMP/vertex-docker.sock" >> "$GITHUB_ENV"
+      - name: Run real applications in standalone and tmux sessions
+        run: zig build test-tuis -Doptimize=ReleaseSafe
+      - name: Record distribution editor versions
+        if: always()
+        run: |
+          mkdir -p compatibility-artifacts
+          dpkg-query -W vim emacs-nox tmux > compatibility-artifacts/distribution-versions.txt
+      - name: Check for newer application releases
+        if: github.event_name == 'schedule'
+        run: python3 tools/check_tui_updates.py
+      - name: Upload compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: application-compatibility
+          path: compatibility-artifacts
+      - name: Stop private Docker daemon
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/vertex-docker.pid"; then sudo kill "$(cat "$RUNNER_TEMP/vertex-docker.pid")"; fi

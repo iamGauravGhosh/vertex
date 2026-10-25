@@ -1,7 +1,7 @@
 const std = @import("std");
 const vt = @import("vertex_terminal");
 
-test "Unicode 15.1 extended grapheme conformance" {
+test "Unicode 18.0 extended grapheme conformance" {
     var lines = std.mem.splitScalar(u8, @embedFile("unicode/GraphemeBreakTest.txt"), '\n');
     var count: usize = 0;
     while (lines.next()) |line| {

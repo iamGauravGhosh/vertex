@@ -1,4 +1,27 @@
 //! Shared defaults for rendering and terminal color queries.
+const std = @import("std");
+
+/// X11 color forms used by OSC 4/10/11/12 (without a system color database).
+pub fn parse(text: []const u8) ?u32 {
+    var components: [3][]const u8 = undefined;
+    if (std.mem.startsWith(u8, text, "rgb:")) {
+        var parts = std.mem.splitScalar(u8, text[4..], '/');
+        for (&components) |*part| part.* = parts.next() orelse return null;
+        if (parts.next() != null) return null;
+    } else if (text.len > 1 and text[0] == '#' and (text.len - 1) % 3 == 0) {
+        const n = (text.len - 1) / 3;
+        if (n == 0 or n > 4) return null;
+        for (&components, 0..) |*part, i| part.* = text[1 + i * n ..][0..n];
+    } else return null;
+    var color: u32 = 0;
+    for (components) |part| {
+        if (part.len == 0 or part.len > 4) return null;
+        const value = std.fmt.parseInt(u32, part, 16) catch return null;
+        const maximum = (@as(u32, 1) << @as(u5, @intCast(4 * part.len))) - 1;
+        color = (color << 8) | (value * 255 / maximum);
+    }
+    return color;
+}
 pub const foreground: u32 = 0xd8dee9;
 pub const background: u32 = 0x15171a;
 pub const palette = [_]u32{

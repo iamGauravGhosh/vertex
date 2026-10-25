@@ -1,0 +1,8 @@
+# Optional local identity. Default TERM stays xterm-256color for SSH portability.
+# Install with: tic -x -o ~/.terminfo assets/vertex.terminfo
+vertex-256color|Vertex terminal with modern editor extensions,
+	Su, RGB, Tc,
+	Smulx=\E[4:%p1%dm,
+	Setulc=\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%dm,
+	Sync=\E[?2026%?%p1%{1}%-%tl%eh%;,
+	use=xterm-256color,

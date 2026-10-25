@@ -211,6 +211,7 @@ pub fn resize(self: *Gpu, width: usize, height: usize) !void {
 }
 
 pub fn render(self: *Gpu, renderer: *Renderer, screen: *const @import("../terminal/root.zig").Screen, damage: *const Renderer.Damage) !void {
+    renderer.reverse_video = screen.reverse_video;
     try self.makeCurrent();
     c.glBindFramebuffer(c.GL_FRAMEBUFFER, self.fbo);
     c.glViewport(0, 0, @intCast(self.width), @intCast(self.height));

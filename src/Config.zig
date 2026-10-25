@@ -39,7 +39,7 @@ pub const Cursor = struct {
     blink_interval: u16 = 500,
     unfocused_hollow: bool = true,
 };
-pub const Action = enum { paste, paste_primary, font_increase, font_decrease, font_reset, opacity_increase, opacity_decrease, reload, fullscreen, new_window, send_text, launch, none, ignore };
+pub const Action = enum { copy, scroll_page_up, scroll_page_down, paste, paste_primary, font_increase, font_decrease, font_reset, opacity_increase, opacity_decrease, reload, fullscreen, new_window, send_text, launch, none, ignore };
 pub const Binding = struct {
     key: []const u8 = "",
     mods: []const u8 = "",
@@ -59,6 +59,10 @@ pub const Mouse = struct {
 };
 pub const Env = @import("platform/Pty.zig").Env;
 pub const Terminal = struct {
+    scrollback_lines: u32 = 10000,
+    scrollback_bytes: u32 = 64 * 1024 * 1024,
+    reflow: bool = true,
+    visual_bell: u16 = 100,
     shell: []const []const u8 = &.{},
     working_directory: ?[]const u8 = null,
     env: []const Env = &.{},
@@ -74,6 +78,9 @@ pub const Values = struct {
     keyboard: struct { bindings: []const Binding = &.{
         .{ .key = "v", .mods = "Control|Shift", .action = .paste },
         .{ .key = "Insert", .mods = "Shift", .action = .paste_primary },
+        .{ .key = "c", .mods = "Control|Shift", .action = .copy },
+        .{ .key = "Page_Up", .mods = "Shift", .action = .scroll_page_up },
+        .{ .key = "Page_Down", .mods = "Shift", .action = .scroll_page_down },
     } } = .{},
     mouse: Mouse = .{},
     terminal: Terminal = .{},
@@ -236,7 +243,7 @@ fn colorValue(node: c.toml_datum_t, key: []const u8) !u32 {
 fn decode(self: *Config, comptime T: type, destination: *T, node: c.toml_datum_t, key: []const u8) anyerror!void {
     const allocator = self.arena.allocator();
     if (key.len != 0 and node.source != null) try self.locations.put(allocator, try allocator.dupe(u8, key), .{ .source = try allocator.dupe(u8, std.mem.span(node.source)), .line = node.lineno, .column = node.colno });
-    if (T == u32) {
+    if (T == u32 and std.mem.startsWith(u8, key, "colors.")) {
         destination.* = try colorValue(node, key);
         return;
     }
@@ -341,6 +348,9 @@ fn validate(self: *Config) !void {
     if (v.window.unfocused_opacity) |opacity| if (opacity < 0 or opacity > 1) return self.bad("window.unfocused_opacity", "expected 0–1", error.InvalidOpacity);
     if (v.colors.dim_factor < 0 or v.colors.dim_factor > 1) return self.bad("colors.dim_factor", "expected 0–1", error.InvalidConfig);
     if (v.mouse.wheel_multiplier < 0 or v.mouse.wheel_multiplier > 100) return self.bad("mouse.wheel_multiplier", "expected 0–100", error.InvalidConfig);
+    if (v.terminal.scrollback_lines > 1000000) return self.bad("terminal.scrollback_lines", "expected 0–1000000", error.InvalidConfig);
+    if (v.terminal.scrollback_bytes > 1024 * 1024 * 1024) return self.bad("terminal.scrollback_bytes", "expected 0–1 GiB", error.InvalidConfig);
+    if (v.terminal.visual_bell > 5000) return self.bad("terminal.visual_bell", "expected 0–5000 milliseconds", error.InvalidConfig);
     if (v.cursor.thickness == 0 or v.cursor.thickness > 128) return self.bad("cursor.thickness", "expected 1–128 logical pixels", error.InvalidCursor);
     if (v.cursor.blink_interval < 100 or v.cursor.blink_interval > 10000) return self.bad("cursor.blink_interval", "expected 100–10000 ms", error.InvalidCursor);
     inline for (.{ "cell_width_offset", "cell_height_offset", "glyph_offset_x", "glyph_offset_y" }) |field| if (@abs(@field(v.font, field)) > 256) return self.bad("font." ++ field, "expected -256–256 logical pixels", error.InvalidFontSpacing);

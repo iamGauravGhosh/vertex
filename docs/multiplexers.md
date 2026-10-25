@@ -43,8 +43,9 @@ Copy commands that emit OSC 52 can update the desktop clipboard, locally or over
 SSH. Vertex accepts clipboard writes up to 8 MiB and never answers clipboard-read
 requests. The Wayland compositor requires focus and a valid input serial; a copy
 requested before the first key/button event waits for one. Native text selection
-UI and standalone scrollback/reflow remain future features; multiplexer copy mode
-and history remain available through the multiplexer.
+and main-screen scrollback/reflow are available as described in the
+[compatibility guide](compatibility.md); multiplexer copy mode and history
+remain available through the multiplexer.
 
 ## Compatibility checks
 

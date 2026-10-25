@@ -10,8 +10,9 @@ and resizable screen model. A separate stdin trace CLI remains available.
 - `src/cli.zig`: window-launch selection, `vertex parse`, and command-line help.
 - `src/terminal/`: allocation-free parsing and event tracing, plus an owned screen
   grid with colors, attributes, cursor state, editing, and scrolling regions.
-  Resizing preserves the top-left overlap without reflow. Scrollback remains a future milestone. `Session` owns main/alternate grids,
-  negotiated input modes, keyboard stacks, and replies.
+  Standalone `Screen` resizing preserves the top-left overlap. `Session` owns
+  main/alternate grids, bounded text history, optional main-screen reflow,
+  selection, negotiated input modes, keyboard stacks, and replies.
 - `src/renderer/`: Fontconfig font selection, HarfBuzz shaping, bounded FreeType
   atlas pages, row/cursor damage, GLES3 rendering, and a CPU reference backend.
 - `src/platform/`: native Wayland globals, xdg-shell, shared-memory buffers,
@@ -37,14 +38,15 @@ modes, perform screen updates, write responses, or access the clipboard.
 `Screen.handle` consumes those events and applies supported text, style, cursor,
 and scrolling commands. The screen allocates at initialization, resize, and
 when extending stored text clusters; ASCII and grid editing
-remain allocation-free. `Screen.apply` reports errors; parser-handler adapters
+remain allocation-free when history capture and image splitting are unnecessary.
+`Screen.apply` reports errors; parser-handler adapters
 latch them for retrieval after a feed. See [the parser guide](vt-parser.md) for syntax and
 [the screen guide](screen.md) for command execution and ownership.
 
 ## Text layout and atlas ownership
 
 Each row caches shaped glyph IDs, font identity, positions, source cell spans,
-and a content fingerprint. Unicode 15.1 graphemes occupy one or two columns;
+and a content fingerprint. Unicode 18.0 graphemes occupy one or two columns;
 continuation cells are never shaped independently. Fontconfig supplies fallback
 faces for complete clusters in stable Fontconfig order, with separate sorted sets
 for regular, bold, italic, and bold-italic styles. The GUI owns a typed TOML configuration snapshot and applies environment
