@@ -45,6 +45,8 @@ The public API is:
 | `takeError()` | Retrieve and clear a latched error; subsequent events in the failed feed were skipped |
 | `getGrapheme(row, column)` | Borrow a cluster’s scalars, or an empty slice for a continuation |
 | `getCell(row, column)` | Return a cell by value, or null outside the grid |
+| `getLink(row, column)` | Borrow the cell's explicit hyperlink target, or null |
+| `getImages()` | Borrow read-only image placements; mutations invalidate the slice |
 | `getRow(row)` | Return a borrowed `[]const Cell`, or null outside the grid |
 | `getCursor()` | Return cursor position and visibility by value |
 | `getRowGeneration(row)` | Return a content generation, or null outside the grid |
@@ -54,7 +56,7 @@ The public API is:
 
 Dimensions must be nonzero; overflowing the cell count or byte size returns
 `error.InvalidDimensions`. Allocation failures return `error.OutOfMemory`.
-ASCII writes and grid edits allocate nothing. Extending graphemes and storing
+ASCII writes and grid edits allocate nothing when no inline images need splitting. Extending graphemes and storing
 formatting controls can allocate; `apply()` reports failures, while `handle()`
 latches them and skips later events until `takeError()`. Treat a failed feed as
 interrupted. Resize deep-copies cluster storage; a failed resize leaves the
@@ -63,7 +65,10 @@ resize does nothing. Resize clears current/saved pending wrap and resets margins
 to the whole screen; other styles and modes remain unchanged. Treat `rows`,
 `columns`, backing storage, and other internal fields as read-only; use events
 and `resize()` to update state. Do not
-duplicate an owning `Screen` or mutate it concurrently.
+duplicate an owning `Screen` or mutate it concurrently. Image pixels and hyperlink
+targets are immutable reference-counted resources shared by independent resized
+grids; cell and placement ownership is updated by screen mutations. Use `Session`
+for OSC 8 and image protocols; see [media](media.md).
 
 Accessors and cursor coordinates are zero-based. Borrowed rows live until a
 successful size-changing `resize()` or `deinit()`; events can change their

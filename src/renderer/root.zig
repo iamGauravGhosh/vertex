@@ -10,6 +10,7 @@ const Colors = @import("../terminal/Colors.zig");
 pub const default_foreground = Colors.foreground;
 pub const default_background = Colors.background;
 pub const Rect = struct { x: i32, y: i32, width: i32, height: i32 };
+pub const Image = struct { bitmap: *const vt.Graphics.Bitmap, destination: Rect, source: Rect, clip: Rect };
 pub const PositionedGlyph = struct {
     id: u32,
     face: usize = 0,
@@ -47,6 +48,7 @@ atlas: Atlas,
 metrics: std.AutoHashMap(u64, Metrics),
 rows: []Row = &.{},
 shaped_rows: usize = 0,
+hover: ?vt.Links.Range = null,
 levels_scratch: std.ArrayList(c.FriBidiLevel) = .empty,
 scripts_scratch: std.ArrayList(c.hb_script_t) = .empty,
 font_cache: std.AutoHashMapUnmanaged(u21, usize) = .empty,
@@ -454,6 +456,12 @@ pub fn visualColumn(self: *Renderer, screen: *const vt.Screen, row: usize, colum
     _ = try self.shapeRow(screen, row);
     return self.visualCached(screen, row, column);
 }
+pub fn logicalColumn(self: *Renderer, screen: *const vt.Screen, row: usize, visual: usize) !usize {
+    if (!self.bidi) return visual;
+    _ = try self.shapeRow(screen, row);
+    for (0..screen.columns) |column| if (self.visualCached(screen, row, column) == visual) return column;
+    return visual;
+}
 fn visualCached(self: *const Renderer, screen: *const vt.Screen, row: usize, column: usize) usize {
     const head = if (screen.getCell(row, column).?.width == 0 and column > 0) column - 1 else column;
     return self.rows[row].visual.items[head] + column - head;
@@ -496,6 +504,7 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
         if (!changed) continue;
         const y: i32 = @intCast(row * ch);
         try painter.fill(.{ .x = 0, .y = y, .width = @intCast(painter.width), .height = @intCast(ch) }, default_background);
+        try self.paintImages(screen, row, 0, painter);
         const cells = screen.getRow(row).?;
         const glyphs = try self.shapeRow(screen, row);
         var background_col: usize = 0;
@@ -507,9 +516,10 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
                 const next = colors(cells[end].style, cursor.visible and cursor.shape == .block and cursor.row == row and cursor.column == end);
                 if (next.bg != rgb.bg or self.visualCached(screen, row, end) != x + end - background_col) break;
             }
-            try painter.fill(.{ .x = @intCast(x * cw), .y = y, .width = @intCast((end - background_col) * cw), .height = @intCast(ch) }, rgb.bg);
+            if (rgb.bg != default_background) try painter.fill(.{ .x = @intCast(x * cw), .y = y, .width = @intCast((end - background_col) * cw), .height = @intCast(ch) }, rgb.bg);
             background_col = end;
         }
+        try self.paintImages(screen, row, 1, painter);
         for (glyphs) |g| {
             if (g.style.hidden) continue;
             const key = (@as(u64, @intCast(g.face)) << 40) | @as(u64, g.id) | (@as(u64, @intFromBool(g.style.bold)) << 32) | (@as(u64, @intFromBool(g.style.italic)) << 33);
@@ -578,7 +588,8 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
             const rgb = colors(cell.style, cursor.visible and cursor.shape == .block and cursor.row == row and cursor.column == col);
             const x: i32 = @intCast(self.visualCached(screen, row, col) * cw);
             const baseline: usize = @intCast(@max(0, self.ascent));
-            if (cell.style.underline) {
+            const hovered = if (self.hover) |range| row * screen.columns + col >= range.first and row * screen.columns + col < range.end else false;
+            if (cell.style.underline or hovered) {
                 const line = @min(ch - 1, (baseline + 1) * self.scale);
                 try painter.fill(.{ .x = x, .y = y + @as(i32, @intCast(line)), .width = @intCast(cw), .height = @intCast(@min(self.scale, ch - line)) }, rgb.fg);
             }
@@ -587,6 +598,7 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
                 try painter.fill(.{ .x = x, .y = y + @as(i32, @intCast(line)), .width = @intCast(cw), .height = @intCast(@min(self.scale, ch - line)) }, rgb.fg);
             }
         }
+        try self.paintImages(screen, row, 2, painter);
         if (cursor.visible and cursor.shape != .block and cursor.row == row) {
             const x: i32 = @intCast(self.visualCached(screen, row, cursor.column) * cw);
             const rgb = colors(cells[cursor.column].style, false);
@@ -595,6 +607,26 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
         }
     }
     try painter.flush();
+}
+
+fn paintImages(self: *Renderer, screen: *const vt.Screen, row: usize, layer: u2, painter: anytype) !void {
+    const cw = self.cell_width * self.scale;
+    const ch = self.cell_height * self.scale;
+    for (screen.graphics.placements.items) |p| {
+        const actual: u2 = if (p.z < -1073741824) 0 else if (p.z < 0) 1 else 2;
+        if (actual != layer) continue;
+        const x: i32 = @intCast(@as(i64, p.column) * @as(i64, @intCast(cw)) + @divFloor(@as(i64, p.x) * @as(i64, @intCast(cw)), @as(i64, @intCast(p.cell_width))));
+        const y: i32 = @intCast(@as(i64, p.row) * @as(i64, @intCast(ch)) + @divFloor(@as(i64, p.y) * @as(i64, @intCast(ch)), @as(i64, @intCast(p.cell_height))));
+        const width: i32 = @intCast(@max(1, p.width * cw / p.cell_width));
+        const height: i32 = @intCast(@max(1, p.height * ch / p.cell_height));
+        const clip_left: i32 = @intCast(@divFloor(@as(i64, p.clip_left) * width, @as(i64, @intCast(p.width))));
+        const clip_top: i32 = @intCast(@divFloor(@as(i64, p.clip_top) * height, @as(i64, @intCast(p.height))));
+        const clip_right: i32 = @intCast(@divFloor(@as(i64, p.clip_right) * width, @as(i64, @intCast(p.width))));
+        const clip_bottom: i32 = @intCast(@divFloor(@as(i64, p.clip_bottom) * height, @as(i64, @intCast(p.height))));
+        const clip = intersect(.{ .x = x + clip_left, .y = y + clip_top, .width = clip_right - clip_left, .height = clip_bottom - clip_top }, .{ .x = 0, .y = @intCast(row * ch), .width = @intCast(painter.width), .height = @intCast(ch) });
+        if (clip.width <= 0 or clip.height <= 0) continue;
+        try painter.image(.{ .bitmap = p.bitmap, .destination = .{ .x = x, .y = y, .width = width, .height = height }, .source = .{ .x = @intCast(p.source_x), .y = @intCast(p.source_y), .width = @intCast(p.source_width), .height = @intCast(p.source_height) }, .clip = clip });
+    }
 }
 
 pub fn drawRows(self: *Renderer, screen: *const vt.Screen, pixels: []u32, width: usize, height: usize, dirty: []const bool) !void {
@@ -630,6 +662,22 @@ pub const Cpu = struct {
         const r = intersect(rect, self.bounds());
         if (r.width == 0 or r.height == 0) return;
         for (@intCast(r.y)..@intCast(r.y + r.height)) |y| @memset(self.pixels[y * self.width + @as(usize, @intCast(r.x)) ..][0..@intCast(r.width)], rgb);
+    }
+    pub fn image(self: *Cpu, value: Image) !void {
+        const r = intersect(intersect(value.destination, value.clip), self.bounds());
+        if (r.width <= 0 or r.height <= 0) return;
+        for (@as(usize, @intCast(r.y))..@intCast(r.y + r.height)) |py| for (@as(usize, @intCast(r.x))..@intCast(r.x + r.width)) |px| {
+            const sx: usize = @intCast(@as(i64, value.source.x) + @divTrunc((2 * (@as(i64, @intCast(px)) - value.destination.x) + 1) * value.source.width, 2 * @as(i64, value.destination.width)));
+            const sy: usize = @intCast(@as(i64, value.source.y) + @divTrunc((2 * (@as(i64, @intCast(py)) - value.destination.y) + 1) * value.source.height, 2 * @as(i64, value.destination.height)));
+            const rgba = value.bitmap.pixels[(sy * value.bitmap.width + sx) * 4 ..][0..4];
+            const at = py * self.width + px;
+            var output: u32 = 0;
+            inline for (.{ 16, 8, 0 }, 0..) |shift, channel| {
+                const v = @as(u32, rgba[channel]) + (((self.pixels[at] >> shift) & 255) * (255 - @as(u32, rgba[3])) + 127) / 255;
+                output |= @as(u32, @min(255, v)) << shift;
+            }
+            self.pixels[at] = output;
+        };
     }
     pub fn mask(self: *Cpu, atlas: *Atlas, region: Atlas.Region, x: i32, y: i32, clip: Rect, rgb: u32) !void {
         const r = intersect(intersect(.{ .x = x, .y = y, .width = @intCast(region.width), .height = @intCast(region.height) }, clip), self.bounds());

@@ -5,6 +5,8 @@ const Screen = @import("Screen.zig");
 const Input = @import("Input.zig");
 const Strings = @import("ControlStrings.zig");
 const Colors = @import("Colors.zig");
+const GraphicsProtocol = @import("GraphicsProtocol.zig");
+pub const Options = GraphicsProtocol.Options;
 const Session = @This();
 const Keyboard = struct {
     flags: u5 = 0,
@@ -20,6 +22,7 @@ keyboards: [2]Keyboard = .{ .{}, .{} },
 replies: std.ArrayList(u8) = .empty,
 failure: ?anyerror = null,
 strings: Strings = .{},
+graphics: GraphicsProtocol = .{},
 /// Set by the host before feeding bytes; monotonic milliseconds, no OS clock here.
 now_ms: i64 = 0,
 sync_deadline_ms: ?i64 = null,
@@ -27,14 +30,22 @@ sync_expired: bool = false,
 geometry: struct { width: usize = 0, height: usize = 0, cell_width: usize = 0, cell_height: usize = 0 } = .{},
 dcs: [4096]u8 = undefined,
 dcs_len: usize = 0,
-dcs_kind: enum { ignored, capabilities, status } = .ignored,
+dcs_kind: enum { ignored, capabilities, status, graphics } = .ignored,
 
 pub fn init(allocator: std.mem.Allocator, rows: usize, columns: usize) !Session {
+    return initWithOptions(allocator, rows, columns, .{});
+}
+pub fn initWithOptions(allocator: std.mem.Allocator, rows: usize, columns: usize, options: Options) !Session {
     var screen = try Screen.init(allocator, rows, columns);
     errdefer screen.deinit();
-    return .{ .allocator = allocator, .screen = screen, .other = try Screen.init(allocator, rows, columns) };
+    var other = try Screen.init(allocator, rows, columns);
+    errdefer other.deinit();
+    if (options.images) try other.graphics.shareBudget(&screen.graphics);
+    if (screen.graphics.budget) |budget| budget.refs += 1;
+    return .{ .allocator = allocator, .screen = screen, .other = other, .graphics = .{ .options = options, .budget = screen.graphics.budget } };
 }
 pub fn deinit(self: *Session) void {
+    self.graphics.deinit(self.allocator);
     self.screen.deinit();
     self.other.deinit();
     self.replies.deinit(self.allocator);
@@ -52,7 +63,7 @@ pub fn getModes(self: *const Session) Input.Modes {
 pub fn takeError(self: *Session) ?anyerror {
     const failure = self.failure;
     self.failure = null;
-    return failure;
+    return failure orelse self.screen.takeError();
 }
 /// Host must wake at the deadline even when PTY output stops.
 pub fn presentationHeld(self: *Session, now_ms: i64) bool {
@@ -91,21 +102,42 @@ pub fn handle(self: *Session, event: Parser.Event) void {
 }
 pub fn apply(self: *Session, event: Parser.Event) !void {
     switch (event) {
-        .osc_begin => self.strings.begin(),
-        .osc_data => |byte| try self.strings.byte(self.allocator, byte),
+        .apc_begin => self.graphics.begin(.kitty),
+        .apc_data => |byte| try self.graphics.byte(self.allocator, byte),
+        .apc_end => |ending| try self.graphics.end(self, ending == .st),
+        .osc_begin => {
+            self.strings.begin();
+            self.graphics.begin(.osc);
+        },
+        .osc_data => |byte| {
+            try self.strings.byte(self.allocator, byte);
+            try self.graphics.byte(self.allocator, byte);
+        },
         .osc_end => |ending| {
             const success = ending == .st or ending == .bel;
             if (success and !self.strings.invalid and !self.strings.is_clipboard) try self.osc(self.strings.small[0..self.strings.used]);
             try self.strings.end(self.allocator, success);
+            try self.graphics.end(self, success);
         },
         .osc => |message| {
             self.strings.begin();
-            for (message.data) |byte| try self.strings.byte(self.allocator, byte);
+            self.graphics.begin(.osc);
+            for (message.data) |byte| {
+                try self.strings.byte(self.allocator, byte);
+                try self.graphics.byte(self.allocator, byte);
+            }
             if (!self.strings.invalid and !self.strings.is_clipboard) try self.osc(self.strings.small[0..self.strings.used]);
             try self.strings.end(self.allocator, true);
+            try self.graphics.end(self, true);
         },
         .dcs_begin => |cmd| {
             self.dcs_len = 0;
+            if (self.graphics.options.images and cmd.private_prefix == null and cmd.intermediates.len == 0 and cmd.final == 'q' and cmd.parameters.len <= 3) {
+                self.dcs_kind = .graphics;
+                self.graphics.begin(.sixel);
+                self.graphics.sixel_params = .{ param(cmd.parameters, 0, 0), param(cmd.parameters, 1, 0), param(cmd.parameters, 2, 0) };
+                return;
+            }
             self.dcs_kind = if (cmd.private_prefix == null and cmd.parameters.len == 0 and cmd.final == 'q') kind: {
                 if (std.mem.eql(u8, cmd.intermediates, "+")) break :kind .capabilities;
                 if (std.mem.eql(u8, cmd.intermediates, "$")) break :kind .status;
@@ -113,16 +145,17 @@ pub fn apply(self: *Session, event: Parser.Event) !void {
             } else .ignored;
         },
         .dcs_data => |byte| if (self.dcs_kind != .ignored) {
-            if (self.dcs_len == self.dcs.len) self.dcs_kind = .ignored else {
+            if (self.dcs_kind == .graphics) try self.graphics.byte(self.allocator, byte) else if (self.dcs_len == self.dcs.len) self.dcs_kind = .ignored else {
                 self.dcs[self.dcs_len] = byte;
                 self.dcs_len += 1;
             }
         },
         .dcs_end => |ending| {
+            if (self.dcs_kind == .graphics) try self.graphics.end(self, ending == .st);
             if (ending == .st) switch (self.dcs_kind) {
                 .capabilities => try self.capabilities(self.dcs[0..self.dcs_len]),
                 .status => try self.status(self.dcs[0..self.dcs_len]),
-                .ignored => {},
+                .ignored, .graphics => {},
             };
             self.dcs_kind = .ignored;
         },
@@ -138,6 +171,7 @@ pub fn apply(self: *Session, event: Parser.Event) !void {
                     self.sync_deadline_ms = null;
                     self.sync_expired = false;
                     self.strings.begin();
+                    self.graphics.reset();
                 },
                 else => {},
             }
@@ -213,6 +247,15 @@ pub fn apply(self: *Session, event: Parser.Event) !void {
                 for (p) |item| if (item.separator == .colon) return;
                 const enabled = cmd.final == 'h';
                 for (p) |item| switch (item.value orelse 0) {
+                    80 => if (self.graphics.options.images) {
+                        self.graphics.sixel_display = enabled;
+                    },
+                    1070 => if (self.graphics.options.images) {
+                        self.graphics.sixel_private = enabled;
+                    },
+                    8452 => if (self.graphics.options.images) {
+                        self.graphics.sixel_right = enabled;
+                    },
                     1 => self.modes.application_cursor = enabled,
                     9, 1000, 1002, 1003 => self.modes.mouse_tracking = if (enabled) item.value.? else 0,
                     1004 => self.modes.focus = enabled,
@@ -242,7 +285,14 @@ pub fn apply(self: *Session, event: Parser.Event) !void {
                 return;
             }
             if (cmd.final == 'c' and prefix == 0 and a == 0) {
-                try self.reply("\x1b[?1;2c");
+                try self.reply(if (self.graphics.options.images) "\x1b[?1;2;4c" else "\x1b[?1;2c");
+                return;
+            }
+            if (cmd.final == 'S' and prefix == '?' and self.graphics.options.images) {
+                var buf: [96]u8 = undefined;
+                if ((a == 1 or a == 2) and (b == 1 or b == 4)) {
+                    try self.reply(if (a == 1) try std.fmt.bufPrint(&buf, "\x1b[?1;0;256S", .{}) else try std.fmt.bufPrint(&buf, "\x1b[?2;0;8192;8192S", .{}));
+                } else try self.reply(try std.fmt.bufPrint(&buf, "\x1b[?{d};1S", .{a}));
                 return;
             }
             if (cmd.final == 'c' and prefix == '>' and a == 0) {
@@ -275,6 +325,7 @@ pub fn apply(self: *Session, event: Parser.Event) !void {
         else => {},
     }
     try self.screen.apply(event);
+    if (self.screen.takeError()) |err| return err;
 }
 fn switchScreen(self: *Session, alternate: bool) void {
     if (self.alternate == alternate) return;
@@ -282,7 +333,7 @@ fn switchScreen(self: *Session, alternate: bool) void {
     self.alternate = alternate;
     self.screen.invalidateAll();
 }
-fn reply(self: *Session, bytes: []const u8) !void {
+pub fn reply(self: *Session, bytes: []const u8) !void {
     if (self.replies.items.len + bytes.len > 65536) return error.ReplyQueueFull;
     try self.replies.appendSlice(self.allocator, bytes);
 }
@@ -299,6 +350,9 @@ fn modeStatus(self: *const Session, mode: u16) u8 {
         25 => self.screen.cursor.visible,
         47, 1047, 1049 => self.alternate,
         69 => self.screen.left_right_mode,
+        80 => if (self.graphics.options.images) self.graphics.sixel_display else return 0,
+        1070 => if (self.graphics.options.images) self.graphics.sixel_private else return 0,
+        8452 => if (self.graphics.options.images) self.graphics.sixel_right else return 0,
         1004 => self.modes.focus,
         1006 => self.modes.mouse_sgr,
         1016 => self.modes.mouse_pixels,
@@ -311,7 +365,16 @@ fn modeStatus(self: *const Session, mode: u16) u8 {
 fn osc(self: *Session, bytes: []const u8) !void {
     var parts = std.mem.splitScalar(u8, bytes, ';');
     const command = parts.next() orelse return;
-    if (std.mem.eql(u8, command, "4")) {
+    if (std.mem.eql(u8, command, "8")) {
+        const params = parts.next() orelse return;
+        const uri = parts.rest();
+        var id: []const u8 = "";
+        var parameters = std.mem.splitScalar(u8, params, ':');
+        while (parameters.next()) |item| if (std.mem.startsWith(u8, item, "id=")) {
+            id = item[3..];
+        };
+        try self.screen.setLink(uri, id);
+    } else if (std.mem.eql(u8, command, "4")) {
         while (parts.next()) |index| {
             const query = parts.next() orelse return;
             const n = std.fmt.parseInt(u8, index, 10) catch continue;

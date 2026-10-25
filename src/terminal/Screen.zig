@@ -4,6 +4,8 @@ const std = @import("std");
 const Parser = @import("Parser.zig");
 const Screen = @This();
 const Unicode = @import("Unicode.zig");
+const Links = @import("Links.zig");
+pub const Graphics = @import("Graphics.zig");
 var next_identity = std.atomic.Value(u64).init(1);
 
 pub const Color = union(enum) {
@@ -26,6 +28,7 @@ pub const Style = struct {
 };
 
 pub const Cell = struct {
+    link: ?*Links.Target = null,
     codepoint: u21 = ' ',
     style: Style = .{},
     width: u2 = 1,
@@ -58,6 +61,8 @@ identity: u64,
 rows: usize,
 columns: usize,
 cells: []Cell,
+graphics: Graphics,
+current_link: ?*Links.Target = null,
 damage_rows: []bool,
 row_generations: []u64,
 tab_stops: []bool,
@@ -96,6 +101,8 @@ pub fn init(allocator: std.mem.Allocator, rows: usize, columns: usize) !Screen {
     for (tab_stops, 0..) |*stop, col| stop.* = col != 0 and col % 8 == 0;
     @memset(row_generations, 1);
     const soft_wrapped = try allocator.alloc(bool, rows);
+    errdefer allocator.free(soft_wrapped);
+    const graphics = try Graphics.init(allocator);
     @memset(soft_wrapped, false);
     @memset(damage_rows, true);
     @memset(cells, .{});
@@ -105,6 +112,7 @@ pub fn init(allocator: std.mem.Allocator, rows: usize, columns: usize) !Screen {
         .rows = rows,
         .columns = columns,
         .cells = cells,
+        .graphics = graphics,
         .damage_rows = damage_rows,
         .row_generations = row_generations,
         .tab_stops = tab_stops,
@@ -115,7 +123,12 @@ pub fn init(allocator: std.mem.Allocator, rows: usize, columns: usize) !Screen {
 }
 
 pub fn deinit(self: *Screen) void {
-    for (self.cells) |cell| self.allocator.free(cell.grapheme);
+    for (self.cells) |cell| {
+        self.allocator.free(cell.grapheme);
+        if (cell.link) |link| link.release();
+    }
+    if (self.current_link) |link| link.release();
+    self.graphics.deinit();
     self.allocator.free(self.cells);
     self.allocator.free(self.damage_rows);
     self.allocator.free(self.row_generations);
@@ -142,6 +155,11 @@ pub fn resized(self: *const Screen, rows: usize, columns: usize) !Screen {
     replacement.cursor = self.cursor;
     replacement.saved = self.saved;
     replacement.style = self.style;
+    const graphics = try self.graphics.clone();
+    replacement.graphics.deinit();
+    replacement.graphics = graphics;
+    replacement.graphics.clip(rows, columns);
+    if (self.current_link) |link| replacement.current_link = link.retain();
     replacement.origin_mode = self.origin_mode;
     replacement.autowrap = self.autowrap;
     replacement.charsets = self.charsets;
@@ -157,8 +175,9 @@ pub fn resized(self: *const Screen, rows: usize, columns: usize) !Screen {
             if (cell.width == 0 or (cell.width == 2 and col + 1 >= columns)) continue;
             var copy = cell;
             copy.grapheme = try self.allocator.dupe(u21, cell.grapheme);
+            if (copy.link) |link| _ = link.retain();
             replacement.cells[row * columns + col] = copy;
-            if (cell.width == 2) replacement.cells[row * columns + col + 1] = .{ .codepoint = 0, .width = 0, .style = cell.style };
+            if (cell.width == 2) replacement.cells[row * columns + col + 1] = .{ .codepoint = 0, .width = 0, .style = cell.style, .link = if (cell.link) |link| link.retain() else null };
         }
     }
     replacement.cursor.row = @min(self.cursor.row, rows - 1);
@@ -172,7 +191,13 @@ pub fn resized(self: *const Screen, rows: usize, columns: usize) !Screen {
 
 /// Reset screen state only. Reset the separate Parser as well to abandon input.
 pub fn reset(self: *Screen) void {
-    for (self.cells) |cell| self.allocator.free(cell.grapheme);
+    for (self.cells) |cell| {
+        self.allocator.free(cell.grapheme);
+        if (cell.link) |link| link.release();
+    }
+    if (self.current_link) |link| link.release();
+    self.current_link = null;
+    self.graphics.clear();
     @memset(self.cells, .{});
     @memset(self.soft_wrapped, false);
     self.last_print = null;
@@ -200,6 +225,33 @@ pub fn reset(self: *Screen) void {
 pub fn getCell(self: *const Screen, row: usize, column: usize) ?Cell {
     if (row >= self.rows or column >= self.columns) return null;
     return self.cells[row * self.columns + column];
+}
+
+/// Borrowed target, valid until the cell is overwritten or screen is destroyed.
+pub fn getLink(self: *const Screen, row: usize, column: usize) ?[]const u8 {
+    const cell = self.getCell(row, column) orelse return null;
+    return if (cell.link) |link| link.uri else null;
+}
+/// Borrowed placement metadata; mutations invalidate the slice.
+pub fn getImages(self: *const Screen) []const Graphics.Placement {
+    return self.graphics.placements.items;
+}
+pub fn setLink(self: *Screen, uri: []const u8, id: []const u8) !void {
+    var target: ?*Links.Target = null;
+    if (uri.len != 0) {
+        if (uri.len > 4096) return;
+        for (uri) |byte| if (byte < 0x20 or byte == 0x7f) return;
+        if (id.len != 0) for (self.cells) |cell| {
+            if (cell.link) |link| if (std.mem.eql(u8, link.id, id) and std.mem.eql(u8, link.uri, uri)) {
+                target = link.retain();
+                break;
+            };
+        };
+        if (target == null) target = try Links.Target.create(self.allocator, uri, id);
+    }
+    if (self.current_link) |old| old.release();
+    self.current_link = target;
+    self.last_print = null;
 }
 
 /// Borrowed rows remain valid until resize/deinit; events update their cells.
@@ -301,6 +353,7 @@ pub fn apply(self: *Screen, event: Parser.Event) !void {
 
 fn clearCell(self: *Screen, at: usize) void {
     self.allocator.free(self.cells[at].grapheme);
+    if (self.cells[at].link) |link| link.release();
     self.cells[at] = .{ .style = self.style };
 }
 fn clearCluster(self: *Screen, at: usize) void {
@@ -321,6 +374,7 @@ fn print(self: *Screen, cp: u21) !void {
             self.allocator.free(cell.grapheme);
             cell.grapheme = joined;
             self.cells[at].grapheme = &.{};
+            self.cells[at].link = null; // transfer ownership into the joined cell
             var target = at;
             self.touch(at / self.columns);
             if (new_width == 2 and at % self.columns == self.rightEdge() - 1) {
@@ -332,7 +386,7 @@ fn print(self: *Screen, cp: u21) !void {
                     target = self.cursor.row * self.columns + self.leftEdge();
                 } else {
                     self.allocator.free(joined);
-                    cell = .{ .codepoint = 0xfffd, .style = cell.style };
+                    cell = .{ .codepoint = 0xfffd, .style = cell.style, .link = cell.link };
                 }
             }
             const old_width = cell.width;
@@ -340,7 +394,7 @@ fn print(self: *Screen, cp: u21) !void {
             if (target != at) self.clearCluster(target);
             if (cell.width == 2) {
                 self.clearCluster(target + 1);
-                self.cells[target + 1] = .{ .codepoint = 0, .width = 0, .style = cell.style };
+                self.cells[target + 1] = .{ .codepoint = 0, .width = 0, .style = cell.style, .link = if (cell.link) |link| link.retain() else null };
             } else if (old_width == 2 and target + 1 < self.cells.len) self.clearCell(target + 1);
             self.cells[target] = cell;
             self.last_print = target;
@@ -381,11 +435,13 @@ fn print(self: *Screen, cp: u21) !void {
         owned = &.{};
     }
     self.clearCluster(at);
+    errdefer self.allocator.free(owned);
+    try self.graphics.erase(self.cursor.row, self.cursor.column, self.cursor.column + actual);
     if (actual == 2) {
         self.clearCluster(at + 1);
-        self.cells[at + 1] = .{ .codepoint = 0, .width = 0, .style = self.style };
+        self.cells[at + 1] = .{ .codepoint = 0, .width = 0, .style = self.style, .link = if (self.current_link) |link| link.retain() else null };
     }
-    self.cells[at] = .{ .codepoint = if (width == 0) 0x25cc else if (width == 2 and actual == 1) 0xfffd else cp, .style = self.style, .width = actual, .grapheme = owned };
+    self.cells[at] = .{ .codepoint = if (width == 0) 0x25cc else if (width == 2 and actual == 1) 0xfffd else cp, .style = self.style, .width = actual, .grapheme = owned, .link = if (self.current_link) |link| link.retain() else null };
     self.last_print = at;
     self.touch(self.cursor.row);
     self.advance(at % self.columns, actual);
@@ -632,12 +688,16 @@ fn blank(self: *Screen, start: usize, end: usize) void {
     if (start >= end) return;
     for (start..end) |at| self.clearCluster(at);
     for (start / self.columns..(end - 1) / self.columns + 1) |row| {
+        self.graphics.erase(row, @max(start, row * self.columns) - row * self.columns, @min(end, (row + 1) * self.columns) - row * self.columns) catch |err| {
+            self.failure = err;
+        };
         if (start <= row * self.columns and end >= (row + 1) * self.columns) self.soft_wrapped[row] = false;
     }
     self.touchRange(start / self.columns, (end - 1) / self.columns + 1);
 }
 
 fn eraseDisplay(self: *Screen, mode: u16) void {
+    if (mode == 2) self.graphics.clear();
     const at = self.cursor.row * self.columns + self.cursor.column;
     switch (mode) {
         0 => self.blank(at, self.cells.len),
@@ -664,6 +724,12 @@ fn insertCharacters(self: *Screen, count: usize) void {
     const n = @min(count, self.rightEdge() - self.cursor.column);
     const start = self.cursor.row * self.columns + self.cursor.column;
     const end = self.cursor.row * self.columns + self.rightEdge();
+    self.graphics.erase(self.cursor.row, self.rightEdge() - n, self.rightEdge()) catch |err| {
+        self.failure = err;
+    };
+    self.graphics.shift(self.cursor.row, self.cursor.column, self.rightEdge() - n, @intCast(n)) catch |err| {
+        self.failure = err;
+    };
     if (self.cells[start].width == 0) self.clearCluster(start);
     if (end - n > start and self.cells[end - n].width == 0) self.clearCluster(end - n);
     for (end - n..end) |at| self.clearCell(at);
@@ -677,6 +743,12 @@ fn deleteCharacters(self: *Screen, count: usize) void {
     const n = @min(count, self.rightEdge() - self.cursor.column);
     const start = self.cursor.row * self.columns + self.cursor.column;
     const end = self.cursor.row * self.columns + self.rightEdge();
+    self.graphics.erase(self.cursor.row, self.cursor.column, self.cursor.column + n) catch |err| {
+        self.failure = err;
+    };
+    self.graphics.shift(self.cursor.row, self.cursor.column + n, self.rightEdge(), -@as(i32, @intCast(n))) catch |err| {
+        self.failure = err;
+    };
     if (self.cells[start].width == 0) self.clearCluster(start);
     if (start + n < end and self.cells[start + n].width == 0) self.clearCluster(start + n);
     for (start..start + n) |at| self.clearCell(at);
@@ -688,6 +760,7 @@ fn deleteCharacters(self: *Screen, count: usize) void {
 
 fn scrollUp(self: *Screen, top: usize, bottom: usize, count: usize) void {
     if (self.left_right_mode) return self.scrollRectangle(top, bottom, count, false);
+    self.graphics.scroll(top, bottom, 0, self.columns, -@as(i32, @intCast(@min(count, bottom - top))));
     const start = top * self.columns;
     const end = bottom * self.columns;
     const distance = @min(count, bottom - top) * self.columns;
@@ -702,6 +775,7 @@ fn scrollUp(self: *Screen, top: usize, bottom: usize, count: usize) void {
 
 fn scrollDown(self: *Screen, top: usize, bottom: usize, count: usize) void {
     if (self.left_right_mode) return self.scrollRectangle(top, bottom, count, true);
+    self.graphics.scroll(top, bottom, 0, self.columns, @intCast(@min(count, bottom - top)));
     const start = top * self.columns;
     const end = bottom * self.columns;
     const distance = @min(count, bottom - top) * self.columns;
@@ -842,6 +916,7 @@ fn scrollRectangle(self: *Screen, top: usize, bottom: usize, count: usize, down:
     const n = @min(count, bottom - top);
     const left = self.scroll_left;
     const right = self.scroll_right;
+    self.graphics.scroll(top, bottom, left, right, @as(i32, @intCast(n)) * (if (down) @as(i32, 1) else -1));
     // A cluster straddling a margin must be erased as a whole before ownership moves.
     for (top..bottom) |row| {
         const base = row * self.columns;

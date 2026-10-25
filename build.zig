@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
     b.installFile("LICENSE", "share/licenses/vertex/LICENSE");
+    if (gui) b.installFile("vendor/stb/LICENSE", "share/licenses/vertex/stb_image-LICENSE");
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.addPassthruArgs();
@@ -124,4 +125,5 @@ fn configureLinux(module: *std.Build.Module, bindings: *std.Build.Module, protoc
         module.linkSystemLibrary(library, .{});
     }
     module.addCSourceFile(.{ .file = protocol });
+    module.addCSourceFile(.{ .file = .{ .cwd_relative = "src/platform/image_decode.c" }, .flags = &.{"-std=c11"} });
 }

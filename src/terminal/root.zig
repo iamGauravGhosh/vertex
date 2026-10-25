@@ -5,6 +5,8 @@ pub const Session = @import("Session.zig");
 pub const Input = @import("Input.zig");
 pub const Unicode = @import("Unicode.zig");
 pub const Screen = @import("Screen.zig");
+pub const Links = @import("Links.zig");
+pub const Graphics = @import("Graphics.zig");
 pub const Cell = Screen.Cell;
 pub const Color = Screen.Color;
 pub const Style = Screen.Style;
@@ -22,4 +24,5 @@ test {
     _ = @import("screen_tests.zig");
     _ = @import("input_tests.zig");
     _ = @import("multiplexer_tests.zig");
+    _ = @import("graphics_tests.zig");
 }

@@ -6,6 +6,7 @@ const Atlas = Renderer.Atlas;
 const Gpu = @This();
 const Vertex = extern struct { x: f32, y: f32, u: f32, v: f32, r: f32, g: f32, b: f32 };
 const SwapDamage = *const fn (c.EGLDisplay, c.EGLSurface, [*c]const c.EGLint, c.EGLint) callconv(.c) c.EGLBoolean;
+const ImageTexture = struct { texture: c.GLuint = 0, identity: u64 = 0, bytes: usize = 0, used: u64 = 0 };
 
 pub const Mode = enum {
     auto,
@@ -39,6 +40,8 @@ viewport_uniform: c.GLint = -1,
 masked_uniform: c.GLint = -1,
 swap_damage: ?SwapDamage = null,
 damage_rects: std.ArrayList(c.EGLint) = .empty,
+images: [8]ImageTexture = @splat(.{}),
+image_clock: u64 = 0,
 
 pub fn init(allocator: std.mem.Allocator, display: *c.wl_display, surface: *c.wl_surface, width: usize, height: usize) !Gpu {
     return create(allocator, display, surface, width, height);
@@ -294,6 +297,79 @@ pub fn upload(self: *Gpu, atlas: *Atlas, region: Atlas.Region) !void {
     try checkGl();
 }
 
+pub fn image(self: *Gpu, value: Renderer.Image) !void {
+    try self.flush();
+    self.image_clock +%= 1;
+    var index: ?usize = null;
+    for (self.images, 0..) |slot, i| if (slot.identity == value.bitmap.identity) {
+        index = i;
+        break;
+    };
+    if (index == null) {
+        var victim: usize = 0;
+        var total: usize = 0;
+        for (self.images, 0..) |slot, i| {
+            total += slot.bytes;
+            if (slot.used < self.images[victim].used) victim = i;
+        }
+        // Both the number of textures and total GPU image storage are bounded.
+        while (total + value.bitmap.pixels.len > 64 * 1024 * 1024) {
+            const old = &self.images[victim];
+            total -= old.bytes;
+            if (old.texture != 0) c.glDeleteTextures(1, &old.texture);
+            old.* = .{};
+            victim = 0;
+            var found = false;
+            for (self.images, 0..) |slot, i| if (slot.bytes != 0 and (!found or slot.used < self.images[victim].used)) {
+                victim = i;
+                found = true;
+            };
+        }
+        // Prefer an empty slot after budget eviction.
+        for (self.images, 0..) |slot, i| if (slot.texture == 0) {
+            victim = i;
+            break;
+        };
+        const slot = &self.images[victim];
+        if (slot.texture == 0) c.glGenTextures(1, &slot.texture);
+        c.glBindTexture(c.GL_TEXTURE_2D, slot.texture);
+        textureParameters();
+        c.glTexImage2D(c.GL_TEXTURE_2D, 0, c.GL_RGBA8, @intCast(value.bitmap.width), @intCast(value.bitmap.height), 0, c.GL_RGBA, c.GL_UNSIGNED_BYTE, value.bitmap.pixels.ptr);
+        slot.identity = value.bitmap.identity;
+        slot.bytes = value.bitmap.pixels.len;
+        index = victim;
+    }
+    const slot = &self.images[index.?];
+    slot.used = self.image_clock;
+    const r = Renderer.intersect(Renderer.intersect(value.destination, value.clip), self.bounds());
+    if (r.width <= 0 or r.height <= 0) return;
+    const d = value.destination;
+    const s = value.source;
+    const bw: f32 = @floatFromInt(value.bitmap.width);
+    const bh: f32 = @floatFromInt(value.bitmap.height);
+    const sw: f32 = @floatFromInt(s.width);
+    const sh: f32 = @floatFromInt(s.height);
+    const dw: f32 = @floatFromInt(d.width);
+    const dh: f32 = @floatFromInt(d.height);
+    const l = (@as(f32, @floatFromInt(s.x)) + @as(f32, @floatFromInt(r.x - d.x)) * sw / dw) / bw;
+    const t = (@as(f32, @floatFromInt(s.y)) + @as(f32, @floatFromInt(r.y - d.y)) * sh / dh) / bh;
+    const right = (@as(f32, @floatFromInt(s.x)) + @as(f32, @floatFromInt(r.x + r.width - d.x)) * sw / dw) / bw;
+    const bottom = (@as(f32, @floatFromInt(s.y)) + @as(f32, @floatFromInt(r.y + r.height - d.y)) * sh / dh) / bh;
+    try self.quad(r, .{ l, t, right, bottom }, 0xffffff, true, 0);
+    // Image quads use their own texture, rather than a glyph atlas page.
+    c.glUseProgram(self.program);
+    c.glUniform2f(self.viewport_uniform, @floatFromInt(self.width), @floatFromInt(self.height));
+    c.glUniform1i(self.masked_uniform, 1);
+    c.glActiveTexture(c.GL_TEXTURE0);
+    c.glBindTexture(c.GL_TEXTURE_2D, slot.texture);
+    c.glBindVertexArray(self.vao);
+    c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
+    c.glBufferData(c.GL_ARRAY_BUFFER, @intCast(self.vertices.items.len * @sizeOf(Vertex)), self.vertices.items.ptr, c.GL_STREAM_DRAW);
+    c.glDrawArrays(c.GL_TRIANGLES, 0, @intCast(self.vertices.items.len));
+    self.vertices.clearRetainingCapacity();
+    try checkGl();
+}
+
 /// Upload existing CPU pages when switching renderers or initializing a new context.
 pub fn syncAtlas(self: *Gpu, atlas: *Atlas) !void {
     for (&atlas.pages, 0..) |*page, i| {
@@ -325,6 +401,9 @@ pub fn deinit(self: *Gpu) void {
         c.glDeleteFramebuffers(1, &self.fbo);
         c.glDeleteTextures(1, &self.color_texture);
         c.glDeleteTextures(Atlas.page_count, &self.textures);
+        for (&self.images) |*slot| if (slot.texture != 0) {
+            c.glDeleteTextures(1, &slot.texture);
+        };
         c.glDeleteBuffers(1, &self.vbo);
         c.glDeleteVertexArrays(1, &self.vao);
         if (self.program != 0) c.glDeleteProgram(self.program);

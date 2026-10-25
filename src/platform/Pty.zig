@@ -9,6 +9,9 @@ pid: c.pid_t,
 status: ?u8 = null,
 
 pub fn spawn(allocator: std.mem.Allocator, command: []const []const u8, rows: usize, columns: usize) !Pty {
+    return spawnPixels(allocator, command, rows, columns, 0, 0);
+}
+pub fn spawnPixels(allocator: std.mem.Allocator, command: []const []const u8, rows: usize, columns: usize, width: usize, height: usize) !Pty {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -35,6 +38,8 @@ pub fn spawn(allocator: std.mem.Allocator, command: []const []const u8, rows: us
     if (c.pipe2(&errors, c.O_CLOEXEC) != 0) return error.PipeFailed;
     defer _ = c.close(errors[0]);
     var size = windowSize(rows, columns);
+    size.ws_xpixel = @intCast(@min(width, 65535));
+    size.ws_ypixel = @intCast(@min(height, 65535));
     var master: c_int = -1;
     const pid = c.forkpty(&master, null, null, &size);
     if (pid < 0) {
@@ -74,7 +79,12 @@ pub fn spawn(allocator: std.mem.Allocator, command: []const []const u8, rows: us
 }
 
 pub fn resize(self: *Pty, rows: usize, columns: usize) !void {
+    try self.resizePixels(rows, columns, 0, 0);
+}
+pub fn resizePixels(self: *Pty, rows: usize, columns: usize, width: usize, height: usize) !void {
     var size = windowSize(rows, columns);
+    size.ws_xpixel = @intCast(@min(width, 65535));
+    size.ws_ypixel = @intCast(@min(height, 65535));
     if (c.ioctl(self.master, c.TIOCSWINSZ, &size) < 0) return error.PtyResizeFailed;
 }
 

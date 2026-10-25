@@ -3,6 +3,9 @@
 `vertex_terminal.Session` is the parser handler for interactive terminals. It
 owns active and inactive `Screen` values, input modes, independent main/alternate
 Kitty stacks, and an ordered reply queue. It has no libc or GUI dependencies.
+OSC 8 targets are supported by default. `initWithOptions` can enable Kitty,
+Sixel, and iTerm2 image handling and inject an encoded-file decoder; see
+[hyperlinks and inline images](media.md). GUI sessions enable images.
 
 ```zig
 var session = try vt.Session.init(allocator, 24, 80);

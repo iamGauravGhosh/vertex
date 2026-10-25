@@ -2,6 +2,22 @@
 const std = @import("std");
 const vt = @import("vertex_terminal");
 
+test "public media API supports links and raw images without libc or an encoded-file decoder" {
+    var session = try vt.Session.initWithOptions(std.testing.allocator, 3, 20, .{ .images = true });
+    defer session.deinit();
+    session.geometry = .{ .width = 160, .height = 48, .cell_width = 8, .cell_height = 16 };
+    var parser = vt.Parser.initWithOptions(.{ .osc_mode = .streaming, .apc_mode = .streaming });
+    parser.feed("\x1b]8;;https://example.com\x07link\x1b]8;;\x07\x1b_Ga=T,f=24,s=1,v=1,C=1;/wAA\x1b\\", &session);
+    try std.testing.expect(session.takeError() == null);
+    try std.testing.expectEqualStrings("https://example.com", session.screen.getLink(0, 0).?);
+    const match = (try vt.Links.find(std.testing.allocator, &session.screen, 0, 1)).?;
+    defer std.testing.allocator.free(match.uri);
+    try std.testing.expectEqualStrings("https://example.com", match.uri);
+    const images: []const vt.Graphics.Placement = session.screen.getImages();
+    try std.testing.expectEqual(@as(usize, 1), images.len);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, images[0].bitmap.pixels);
+}
+
 test {
     _ = @import("unicode_conformance.zig");
 }

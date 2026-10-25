@@ -14,6 +14,126 @@ test {
     _ = @import("performance_tests.zig");
 }
 
+test "memory image decoder handles PNG JPEG first GIF frame and rejects malformed dimensions" {
+    const Decoder = @import("platform/ImageDecoder.zig");
+    const png_file = try imageFixture("tests/images/rgba.png");
+    defer t.allocator.free(png_file);
+    const png = try Decoder.decode(t.allocator, png_file);
+    defer t.allocator.free(png.pixels);
+    try t.expectEqual(@as(usize, 2), png.width);
+    try t.expectEqualSlices(u8, &.{ 255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 255, 255, 255, 255, 0 }, png.pixels);
+    const jpeg_file = try imageFixture("tests/images/rgb.jpg");
+    defer t.allocator.free(jpeg_file);
+    const jpeg = try Decoder.decode(t.allocator, jpeg_file);
+    defer t.allocator.free(jpeg.pixels);
+    try t.expectEqual(@as(usize, 2), jpeg.width);
+    try t.expect(jpeg.pixels[0] >= 250 and jpeg.pixels[1] <= 5 and jpeg.pixels[3] == 255);
+    const gif_file = try imageFixture("tests/images/animated.gif");
+    defer t.allocator.free(gif_file);
+    const gif = try Decoder.decode(t.allocator, gif_file);
+    defer t.allocator.free(gif.pixels);
+    try t.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, gif.pixels);
+    try t.expectError(error.InvalidImage, Decoder.decode(t.allocator, "not an image"));
+    const oversized = try t.allocator.dupe(u8, png_file);
+    defer t.allocator.free(oversized);
+    @memcpy(oversized[16..20], &[_]u8{ 0, 1, 0, 0 });
+    try t.expectError(error.InvalidImage, Decoder.decode(t.allocator, oversized));
+}
+
+fn imageFixture(path: [:0]const u8) ![]u8 {
+    const fd = c.open(path, c.O_RDONLY | c.O_CLOEXEC);
+    if (fd < 0) return error.FixtureMissing;
+    defer _ = c.close(fd);
+    var data: [4096]u8 = undefined;
+    const n = c.read(fd, &data, data.len);
+    if (n <= 0 or n == data.len) return error.InvalidFixture;
+    return t.allocator.dupe(u8, data[0..@intCast(n)]);
+}
+
+test "inline images match CPU GPU full and damaged frames through layering scroll erase and scale" {
+    const Gpu = @import("renderer/Gpu.zig");
+    const Decoder = @import("platform/ImageDecoder.zig");
+    var renderer = try Renderer.initFont(t.allocator, "DejaVu Sans");
+    defer renderer.deinit();
+    var reference = try Renderer.initFont(t.allocator, "DejaVu Sans");
+    defer reference.deinit();
+    var session = try vt.Session.initWithOptions(t.allocator, 5, 16, .{ .images = true, .decoder = Decoder.decode });
+    defer session.deinit();
+    session.geometry = .{ .width = renderer.cell_width * 16, .height = renderer.cell_height * 5, .cell_width = renderer.cell_width, .cell_height = renderer.cell_height };
+    var parser = vt.Parser.initWithOptions(.{ .osc_mode = .streaming, .apc_mode = .streaming });
+    const width = session.geometry.width;
+    const height = session.geometry.height;
+    var gpu = Gpu.initHeadless(t.allocator, width, height) catch |err| {
+        if (c.getenv("VERTEX_TEST_GPU") != null) return err;
+        return error.SkipZigTest;
+    };
+    defer gpu.deinit();
+    var damage = Renderer.Damage.init(t.allocator);
+    defer damage.deinit();
+    const pixels = try t.allocator.alloc(u32, width * height);
+    defer t.allocator.free(pixels);
+    const expected = try t.allocator.alloc(u32, pixels.len);
+    defer t.allocator.free(expected);
+    const edits = [_][]const u8{
+        "\x1b[?25l\x1b_Ga=T,f=32,s=2,v=2,i=1,C=1,c=3,r=2,z=-1;/wAA/wD/AIAAAP//////AA==\x1b\\",
+        "\x1b[2;2H\x1b_Ga=p,i=1,p=2,C=1,c=2,r=2,z=1;\x1b\\",
+        "\x1b[1;1H\x1b[44mAB\x1b[0m\x1b_Ga=p,i=1,p=3,C=1,c=3,r=1,z=-2000000000;\x1b\\",
+        "\x1b_Ga=d,d=i,i=1,p=2;\x1b\\",
+        "\x1b[2;1H\x1bP0;1q\"1;1;8;6#1;2;100;0;0!8~\x1b\\",
+        "\x1b[2;1H\x1b[K",
+        "\x1b[S",
+        "\x1b[T",
+        "\x1b[2J",
+        "\x1b_Ga=T,f=24,s=1,v=1,i=9,C=1,c=2,r=1;AP8A\x1b\\",
+    };
+    for (edits) |edit| {
+        parser.feed(edit, &session);
+        try t.expect(session.takeError() == null);
+        if (!try damage.prepare(&session.screen, width, height, renderer.cell_height)) continue;
+        if (damage.full) @memset(pixels, Renderer.default_background);
+        try renderer.drawRows(&session.screen, pixels, width, height, damage.rows);
+        try gpu.render(&renderer, &session.screen, &damage);
+        try reference.draw(&session.screen, expected, width, height);
+        try t.expectEqualSlices(u32, expected, pixels);
+        try expectGpuPixels(&gpu, expected);
+        damage.commit(&session.screen);
+    }
+    try t.expect(!try damage.prepare(&session.screen, width, height, renderer.cell_height));
+    // A CPU reference frame also verifies that fallback does not lose resources.
+    try renderer.setScale(2);
+    try reference.setScale(2);
+    damage.invalidate();
+    _ = try damage.prepare(&session.screen, width, height, renderer.cell_height * 2);
+    try renderer.draw(&session.screen, pixels, width, height);
+    try gpu.render(&renderer, &session.screen, &damage);
+    try expectGpuPixels(&gpu, pixels);
+}
+
+test "hover underline preserves styles and bidi pointer mapping finds logical hyperlinks" {
+    var renderer = try Renderer.initFont(t.allocator, "DejaVu Sans");
+    defer renderer.deinit();
+    renderer.bidi = true;
+    var session = try vt.Session.init(t.allocator, 2, 20);
+    defer session.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("\x1b[?25lאב \x1b]8;;https://example.com\x07界\x1b]8;;\x07", &session);
+    const visual = try renderer.visualColumn(&session.screen, 0, 3);
+    const logical = try renderer.logicalColumn(&session.screen, 0, visual);
+    const match = (try vt.Links.find(t.allocator, &session.screen, 0, logical)).?;
+    defer t.allocator.free(match.uri);
+    const width = renderer.cell_width * 20;
+    const height = renderer.cell_height * 2;
+    const before = try t.allocator.alloc(u32, width * height);
+    defer t.allocator.free(before);
+    const after = try t.allocator.alloc(u32, before.len);
+    defer t.allocator.free(after);
+    try renderer.draw(&session.screen, before, width, height);
+    renderer.hover = match.range;
+    try renderer.draw(&session.screen, after, width, height);
+    try t.expect(!std.mem.eql(u32, before, after));
+    try t.expect(!session.screen.cells[3].style.underline);
+}
+
 test "shaping generations reuse cursor-only rows and invalidate deferred edits and screen switches" {
     var renderer = try Renderer.initFont(t.allocator, "Vertex Test Mono");
     defer renderer.deinit();
@@ -84,6 +204,19 @@ fn waitExit(pty: *Pty) !u8 {
         _ = c.poll(null, 0, 10);
     }
     return error.ChildDidNotExit;
+}
+
+test "PTY supplies initial and resized pixel geometry to image clients" {
+    var pty = try Pty.spawnPixels(t.allocator, &.{ "/bin/sh", "-c", "read answer" }, 24, 80, 640, 384);
+    defer pty.deinit();
+    var size: c.winsize = undefined;
+    try t.expectEqual(@as(c_int, 0), c.ioctl(pty.master, c.TIOCGWINSZ, &size));
+    try t.expectEqual(@as(u16, 640), size.ws_xpixel);
+    try t.expectEqual(@as(u16, 384), size.ws_ypixel);
+    try pty.resizePixels(30, 100, 800, 480);
+    try t.expectEqual(@as(c_int, 0), c.ioctl(pty.master, c.TIOCGWINSZ, &size));
+    try t.expectEqual(@as(u16, 800), size.ws_xpixel);
+    try t.expectEqual(@as(u16, 480), size.ws_ypixel);
 }
 
 test "PTY gives the child a controlling terminal, environment, input, and initial size" {

@@ -70,22 +70,23 @@ surrounding text because it cannot infer the application's editable buffer.
 
 ## Image extension boundary
 
-APC, OSC, and DCS payload events provide transport for future Kitty, iTerm2, and
+APC, OSC, and DCS payload events provide transport for Kitty, iTerm2, and
 Sixel handlers. APC/OSC streaming is opt-in; DCS always streams after its header.
 Large payloads need no whole-message buffer in the parser.
 
-Image support will follow this path:
+Image support follows this path:
 
 ```text
 Parser events -> protocol handler -> decoder -> image store/placements -> renderer
 ```
 
-Handlers will recognize protocol headers, assemble transfers, decode base64,
-apply budgets, and generate replies. Decoders will produce validated pixels;
-the image store will own their memory and placement relative to terminal cells.
-The renderer will upload and draw those pixels. No backend or decoder interface
-is fixed before those components exist. A consumer must discard provisional
-data when a transfer is interrupted, cancelled, or ends before completion.
+`GraphicsProtocol` recognizes protocol headers, assembles transfers, decodes
+base64/zlib, applies budgets, and generates replies. `Sixel` produces pixels;
+an injected decoder handles encoded image files. `Screen.graphics` owns immutable
+reference-counted pixel buffers and screen-local placements. Both painters draw
+the same clipped, layered pixels. Incomplete transfers are discarded. OSC 8
+targets are owned independently of SGR styles and retained by cells; the desktop
+adapter opens validated targets on Ctrl+click. See [media](media.md).
 
 ## Linux integration
 
@@ -138,4 +139,4 @@ instances at different geometries/scales, forces both backends, injects an EGL
 initialization failure to verify auto fallback, and checks partial damage and
 idle frame suppression. The optional `VERTEX_TEST_WAYLAND=1` integration
 test opens a real window, renders a short command, and checks its exit status.
-Scrollback, selection/copy UI, images, and full xterm compatibility remain future work.
+Scrollback, selection/copy UI, image animation, and full xterm compatibility remain future work.

@@ -9,6 +9,8 @@ const input = @import("input.zig");
 const common = @import("common.zig");
 const Clipboard = @import("Clipboard.zig");
 const Ime = @import("Ime.zig");
+const Desktop = @import("Desktop.zig");
+const ImageDecoder = @import("ImageDecoder.zig");
 
 const Output = struct { app: *App, name: u32, object: *c.wl_output, scale: usize = 1, entered: bool = false };
 const Buffer = struct {
@@ -59,7 +61,7 @@ pub fn run(allocator: std.mem.Allocator, command: []const []const u8) !u8 {
         .damage = Renderer.Damage.init(allocator),
     };
     defer app.deinit();
-    app.session = try vt.Session.init(allocator, 24, 80);
+    app.session = try vt.Session.initWithOptions(allocator, 24, 80, .{ .images = true, .decoder = ImageDecoder.decode });
     app.screen = app.session.activeScreen();
     app.screen_ready = true;
     const bidi = c.getenv("VERTEX_BIDI");
@@ -85,7 +87,7 @@ const App = struct {
     backend_started: bool = false,
     damage: ?Renderer.Damage = null,
     pixels: []u32 = &.{},
-    parser: vt.Parser = vt.Parser.initWithOptions(.{ .osc_mode = .streaming }),
+    parser: vt.Parser = vt.Parser.initWithOptions(.{ .osc_mode = .streaming, .apc_mode = .streaming }),
     pty: ?Pty = null,
     pty_eof: bool = false,
     display: ?*c.wl_display = null,
@@ -107,6 +109,9 @@ const App = struct {
     pointer_y: f64 = 0,
     pointer_buttons: u8 = 0,
     pointer_last: ?[2]usize = null,
+    link_click: bool = false,
+    desktop: Desktop = .{},
+    open_uri: *const fn (*App, []const u8) anyerror!void = openUri,
     axes: [2]f64 = @splat(0),
     axis_values: [2]f64 = @splat(0),
     axis_discrete: [2]i32 = @splat(0),
@@ -172,6 +177,7 @@ const App = struct {
 
     fn loop(self: *App, command: []const []const u8) !u8 {
         while (!self.closing) {
+            self.desktop.poll();
             if (self.failure) |failure| return failure;
             if (self.clipboard.failure) |failure| return failure;
             if (self.ime.failure) |failure| return failure;
@@ -191,7 +197,9 @@ const App = struct {
             }
             if (self.configured) {
                 try self.applySize();
-                if (self.pty == null) self.pty = try Pty.spawn(self.allocator, command, self.screen.rows, self.screen.columns);
+                if (self.pty == null) {
+                    self.pty = try Pty.spawnPixels(self.allocator, command, self.screen.rows, self.screen.columns, self.session.geometry.width, self.session.geometry.height);
+                }
                 try self.flushInput();
                 try self.drainPty();
                 if (try self.pty.?.pollExit()) |status| {
@@ -204,6 +212,7 @@ const App = struct {
                 self.clipboard.focused = self.focused;
                 try self.clipboard.publish();
                 self.clipboard.pump();
+                try self.updateHover();
                 try self.draw();
             }
             while (c.wl_display_prepare_read(self.display) != 0) {
@@ -281,9 +290,9 @@ const App = struct {
         const rows = @max(1, self.height / self.renderer.cell_height);
         const columns = @max(1, self.width / self.renderer.cell_width);
         try self.session.resize(rows, columns);
-        if (self.pty) |*pty| try pty.resize(rows, columns);
         try self.renderer.setScale(self.scale);
         self.session.geometry = .{ .width = self.width * self.scale, .height = self.height * self.scale, .cell_width = self.renderer.cell_width * self.scale, .cell_height = self.renderer.cell_height * self.scale };
+        if (self.pty) |*pty| try pty.resizePixels(rows, columns, self.session.geometry.width, self.session.geometry.height);
         c.wl_surface_set_buffer_scale(self.surface, @intCast(self.scale));
         for (self.buffers.items) |buffer| {
             if (buffer.width != self.width * self.scale or buffer.height != self.height * self.scale or buffer.pending_rows.len != self.screen.rows) buffer.retired = true;
@@ -445,6 +454,32 @@ const App = struct {
         buffer.busy = true;
         damage.commit(displayed);
         if (overlay != null) self.screen.clearDamage();
+    }
+
+    fn openUri(self: *App, uri: []const u8) !void {
+        try self.desktop.open(self.allocator, uri);
+    }
+    fn linkAtPointer(self: *App) !?vt.Links.Match {
+        if (!self.pointer_inside or !self.screen_ready or self.pointer_x < 0 or self.pointer_y < 0) return null;
+        const col: usize = @intFromFloat(@floor(self.pointer_x / @as(f64, @floatFromInt(self.renderer.cell_width))));
+        const row: usize = @intFromFloat(@floor(self.pointer_y / @as(f64, @floatFromInt(self.renderer.cell_height))));
+        if (row >= self.screen.rows or col >= self.screen.columns) return null;
+        const logical = try self.renderer.logicalColumn(self.screen, row, col);
+        return vt.Links.find(self.allocator, self.screen, row, logical);
+    }
+    fn updateHover(self: *App) !void {
+        const match = try self.linkAtPointer();
+        defer if (match) |value| self.allocator.free(value.uri);
+        const next = if (match) |value| value.range else null;
+        if (std.meta.eql(next, self.renderer.hover)) return;
+        if (self.renderer.hover) |old| self.damageLink(old);
+        self.renderer.hover = next;
+        if (next) |range| self.damageLink(range);
+    }
+    fn damageLink(self: *App, range: vt.Links.Range) void {
+        const first = @min(self.screen.rows, range.first / self.screen.columns);
+        const end = @min(self.screen.rows, (range.end + self.screen.columns - 1) / self.screen.columns);
+        for (first..end) |row| self.screen.damage_rows[row] = true;
     }
 
     fn createBuffer(self: *App) !*Buffer {
@@ -904,6 +939,7 @@ fn releasePointer(object: *c.wl_pointer) void {
 }
 fn sendPointer(self: *App, kind: @FieldType(vt.Input.Pointer, "kind"), button: u8) void {
     if (!self.pointer_inside or !self.screen_ready) return;
+    if (self.link_click and kind == .motion) return;
     const x: usize = @intFromFloat(@max(0, self.pointer_x));
     const y: usize = @intFromFloat(@max(0, self.pointer_y));
     const col = @min(self.screen.columns - 1, x / self.renderer.cell_width);
@@ -932,6 +968,7 @@ fn pointerLeave(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: ?*c.wl_surface)
     const self = appFrom(data);
     self.pointer_inside = false;
     self.pointer_buttons = 0;
+    self.link_click = false;
     self.pointer_last = null;
     self.axes = @splat(0);
 }
@@ -954,6 +991,21 @@ fn pointerButton(data: ?*anyopaque, _: ?*c.wl_pointer, serial: u32, _: u32, butt
     if (pressed) self.clipboard.serial = serial;
     const bit = @as(u8, 1) << @intCast(number);
     if (pressed) self.pointer_buttons |= bit else self.pointer_buttons &= ~bit;
+    if (number == 0) {
+        if (!pressed and self.link_click) {
+            self.link_click = false;
+            return;
+        }
+        if (pressed and self.modifiers().control) {
+            const match = self.linkAtPointer() catch null;
+            if (match) |value| {
+                defer self.allocator.free(value.uri);
+                self.link_click = true;
+                self.open_uri(self, value.uri) catch |err| std.debug.print("vertex: cannot open link ({s})\n", .{@errorName(err)});
+                return;
+            }
+        }
+    }
     if (number == 1 and pressed and (self.session.modes.mouse_tracking == 0 or self.modifiers().shift)) {
         self.clipboard.request(true) catch |err| {
             self.failure = err;
@@ -1062,6 +1114,49 @@ test "Wayland pointer callbacks encode drag release pixel and wheel events" {
     pointerButton(&app, null, 0, 0, 0x111, c.WL_POINTER_BUTTON_STATE_PRESSED);
     try std.testing.expectEqualStrings("\x1b[<2;25;17M", app.pending.items);
     try std.testing.expect(app.failure == null);
+}
+
+test "Ctrl click opens the hovered link and consumes the gesture during mouse reporting" {
+    const Capture = struct {
+        fn open(app: *App, uri: []const u8) !void {
+            try app.pending.appendSlice(app.allocator, uri);
+        }
+    };
+    var app: App = .{ .allocator = std.testing.allocator, .renderer = try Renderer.initFont(std.testing.allocator, "DejaVu Sans"), .screen = undefined, .open_uri = Capture.open };
+    defer app.renderer.deinit();
+    defer app.pending.deinit(app.allocator);
+    app.session = try vt.Session.init(app.allocator, 2, 30);
+    defer app.session.deinit();
+    app.screen = app.session.activeScreen();
+    app.screen_ready = true;
+    const context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbFailed;
+    defer c.xkb_context_unref(context);
+    const keymap = c.xkb_keymap_new_from_names(context, null, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbFailed;
+    defer c.xkb_keymap_unref(keymap);
+    const state = c.xkb_state_new(keymap) orelse return error.XkbFailed;
+    defer c.xkb_state_unref(state);
+    app.key_state = state;
+    const ctrl = c.xkb_keymap_mod_get_index(keymap, c.XKB_MOD_NAME_CTRL);
+    _ = c.xkb_state_update_mask(state, @as(u32, 1) << @intCast(ctrl), 0, 0, 0, 0, 0);
+    var parser = vt.Parser.init();
+    parser.feed("https://example.com", &app.session);
+    app.session.modes.mouse_tracking = 1003;
+    app.session.modes.mouse_sgr = true;
+    pointerEnter(&app, null, 1, null, @intCast(app.renderer.cell_width * 256), 0);
+    try app.updateHover();
+    try std.testing.expect(app.renderer.hover != null);
+    pointerButton(&app, null, 1, 0, 0x110, c.WL_POINTER_BUTTON_STATE_PRESSED);
+    pointerMotion(&app, null, 0, @intCast(app.renderer.cell_width * 512), 0);
+    pointerButton(&app, null, 1, 0, 0x110, c.WL_POINTER_BUTTON_STATE_RELEASED);
+    try std.testing.expectEqualStrings("https://example.com", app.pending.items);
+    app.pending.clearRetainingCapacity();
+    _ = c.xkb_state_update_mask(state, 0, 0, 0, 0, 0, 0);
+    pointerButton(&app, null, 1, 0, 0x110, c.WL_POINTER_BUTTON_STATE_PRESSED);
+    pointerButton(&app, null, 1, 0, 0x110, c.WL_POINTER_BUTTON_STATE_RELEASED);
+    try std.testing.expectEqualStrings("\x1b[<0;3;1M\x1b[<0;3;1m", app.pending.items);
+    pointerLeave(&app, null, 0, null);
+    try app.updateHover();
+    try std.testing.expect(app.renderer.hover == null);
 }
 
 test "keyboard focus loss disarms repeat in the kernel and clears composed input" {

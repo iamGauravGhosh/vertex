@@ -35,5 +35,6 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
+#include "image_decode.h"
 extern char **environ;
 #endif

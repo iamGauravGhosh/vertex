@@ -21,10 +21,11 @@ Those features belong to the multiplexer. Vertex does not launch or install one
 automatically. See [multiplexer workflows and validation](docs/multiplexers.md)
 for local/SSH use, clipboard behavior, and performance measurements.
 The parser handles incremental UTF-8 text and ESC, CSI, OSC, DCS, and opt-in APC
-sequences without allocating memory. OSC/APC streaming hooks allow future image
-protocol consumers to process large transfers. The resizable screen model
+sequences without allocating memory. Streamed handlers support static Kitty,
+Sixel, and iTerm2 inline images. The resizable screen model
 applies text, ANSI 16/256/RGB colors and attributes, cursor movement, editing,
-and scrolling regions to a grid of cells. Image decoding remains future work.
+and scrolling regions to a grid of cells, with OSC 8 hyperlinks and detected web
+URLs opened through Ctrl+click. See [hyperlinks and images](docs/media.md).
 
 ## Development goals
 
@@ -82,7 +83,8 @@ The archive contains `vertex`, `README.md`, and `LICENSE` in a matching director
 The executable is built with Zig 0.17.0 in ReleaseSafe mode for a baseline x86_64
 CPU on Ubuntu 24.04. It needs a compatible Linux/glibc system, a Wayland compositor,
 Wayland client/EGL libraries, xkbcommon, FreeType, Fontconfig, HarfBuzz, FriBidi, EGL,
-OpenGL ES libraries, and a monospace font. EGL/GLES libraries are required even
+OpenGL ES libraries, and a monospace font. `xdg-open` is needed to open links.
+EGL/GLES libraries are required even
 when selecting CPU rendering; an available GPU driver is optional in auto mode.
 On Ubuntu 24.04, install the runtime dependencies with:
 
@@ -202,7 +204,7 @@ not advertised.
   over SSH. Decoding is streamed and capped at 8 MiB; clipboard reads are disabled.
   Publishing waits for window focus and a valid Wayland input serial.
 
-Scrollback history, selection/copy UI, images, fractional-scale protocols, and
+Scrollback history, selection/copy UI, image animation, fractional-scale protocols, and
 full xterm compatibility remain future work. Resizing preserves the top-left
 intersection without reflow. Blink is rendered steadily. Color-font SVG and
 COLRv1 painting are not supported.
@@ -251,3 +253,4 @@ vertex/
 See [the architecture notes](docs/architecture.md) for integration details.
 
 Vertex uses the [MIT license](LICENSE). The parser has no external dependencies.
+GUI image decoding includes [stb_image under its MIT license](vendor/stb/LICENSE).

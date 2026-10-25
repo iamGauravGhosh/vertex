@@ -83,6 +83,7 @@ jobs:
           mkdir -p "dist/$package"
           install -m 755 zig-out/bin/vertex "dist/$package/vertex"
           install -m 644 README.md zig-out/share/licenses/vertex/LICENSE "dist/$package/"
+          install -m 644 zig-out/share/licenses/vertex/stb_image-LICENSE "dist/$package/"
           tar -C dist -czf "dist/$package.tar.gz" "$package"
           cd dist
           sha256sum "$package.tar.gz" > "$package.tar.gz.sha256"

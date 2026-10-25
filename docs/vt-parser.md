@@ -128,7 +128,7 @@ terminator; it never dispatches a truncated message. Streamed payloads have no
 parser byte-count limit or counter that grows with transfer size. Consumers
 supply transfer budgets. Parser memory stays fixed in all modes.
 
-## Future image integration
+## Image integration
 
 Enable the hooks with:
 
@@ -139,31 +139,32 @@ var parser = vt.Parser.initWithOptions(.{
 });
 ```
 
-A future consumer will route APC beginning with `G` to a Kitty handler, OSC
+`Session` routes APC beginning with `G` to a Kitty handler, OSC
 command 1337 to an iTerm2 handler, and the appropriate DCS `q` header to a Sixel
-handler. The parser forwards framing and bytes; it does not claim to implement
-these image protocols. Unknown payloads can be discarded by the consumer.
+handler when image handling is enabled. The parser forwards framing and bytes;
+protocol implementation belongs to `Session`, separately from parsing.
 
-The intended layers are:
+The layers are:
 
 ```text
 PTY bytes -> parser -> protocol handlers -> image decoding
                                         -> image storage and placement -> renderer
 ```
 
-Protocol handlers will manage metadata, multi-message transfers, base64,
-compression, replies, and transfer budgets. Decoders will validate formats,
-output dimensions, and pixel-memory limits. Storage/placement will manage image
-IDs, cell anchors, scrolling, eviction, and deletion. Rendering will own texture
-uploads, clipping, and drawing. These layers can evolve without putting an
+Protocol handlers manage metadata, multi-message transfers, base64,
+compression, replies, and transfer budgets. Decoders validate formats,
+output dimensions, and pixel-memory limits. Storage/placement manages image
+IDs, cell anchors, scrolling, and deletion. Rendering owns texture
+uploads, clipping, and drawing. These layers avoid putting an
 allocator, file access, or graphics backend into the parser.
 
 Treat streamed data as provisional until a successful ST/BEL ending. On
 cancellation, interruption, EOF, or consumer rejection, discard incomplete
 transfer state. Rejected transfers can continue draining parser events until
 the ending; do not reset the parser mid-payload and expose the rest as text.
-A PNG or other decoder can be integrated later behind these boundaries; any
-third-party decoder will carry its own licensing requirements.
+The GUI injects the vendored stb decoder. Portable consumers can inject their own
+decoder or enable raw Kitty/Sixel images without one. See [media](media.md) for
+the supported subset, limits, ownership contracts, and examples.
 
 ## Trace command and validation
 
