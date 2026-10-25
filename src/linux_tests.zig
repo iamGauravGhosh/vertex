@@ -9,6 +9,35 @@ const Renderer = @import("renderer/root.zig");
 const vt = @import("terminal/root.zig");
 const linux = @import("platform/linux.zig");
 
+test {
+    _ = linux;
+    _ = @import("performance_tests.zig");
+}
+
+test "shaping generations reuse cursor-only rows and invalidate deferred edits and screen switches" {
+    var renderer = try Renderer.initFont(t.allocator, "Vertex Test Mono");
+    defer renderer.deinit();
+    var session = try vt.Session.init(t.allocator, 2, 12);
+    defer session.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("first", &session);
+    _ = try renderer.shapeRow(&session.screen, 0);
+    const shaped = renderer.shaped_rows;
+    parser.feed("\x1b[1;1H\x1b[6 q\x1b[31m", &session);
+    _ = try renderer.shapeRow(&session.screen, 0);
+    try t.expectEqual(shaped, renderer.shaped_rows);
+    parser.feed("A", &session);
+    _ = try renderer.shapeRow(&session.screen, 0);
+    parser.feed("B", &session); // damage has deliberately not been acknowledged
+    _ = try renderer.shapeRow(&session.screen, 0);
+    try t.expectEqual(shaped + 2, renderer.shaped_rows);
+    parser.feed("\x1b[?1049hother", &session);
+    _ = try renderer.shapeRow(&session.screen, 0);
+    parser.feed("\x1b[?1049l", &session);
+    _ = try renderer.shapeRow(&session.screen, 0);
+    try t.expectEqual(shaped + 4, renderer.shaped_rows);
+}
+
 test "the complete native event loop compiles" {
     std.mem.doNotOptimizeAway(&linux.run);
 }

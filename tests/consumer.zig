@@ -23,6 +23,23 @@ test "a public session consumer negotiates input and drains replies without OS d
     try std.testing.expect(session.getModes().bracketed_paste);
 }
 
+test "a public host can schedule synchronized presentation and own streamed clipboard writes" {
+    var session = try vt.Session.init(std.testing.allocator, 2, 8);
+    defer session.deinit();
+    var parser = vt.Parser.initWithOptions(.{ .osc_mode = .streaming });
+    try std.testing.expect(!session.presentationHeld(1000));
+    parser.feed("\x1b[?2026hA\x1b]52;c;YWJj\x07", &session);
+    if (session.takeError()) |err| return err;
+    try std.testing.expect(session.presentationHeld(1100));
+    const copied = session.takeClipboard().?;
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings("abc", copied);
+    try std.testing.expect(session.activeScreen().getRowGeneration(0) != null);
+    try std.testing.expect(session.activeScreen().getRowGeneration(2) == null);
+    try std.testing.expect(!session.presentationHeld(1150));
+    try std.testing.expect(session.activeScreen().getDamageRows()[0]);
+}
+
 test "a public screen consumer applies colors cursor movement and scrolling" {
     var screen = try vt.Screen.init(std.testing.allocator, 2, 4);
     defer screen.deinit();

@@ -60,6 +60,23 @@ pub fn build(b: *std.Build) void {
         bindings.linkSystemLibrary("glesv2", .{});
         bindings.linkSystemLibrary("wayland-egl", .{});
         const c_module = bindings.createModule();
+        // Separate integration step: these binaries are never Vertex runtime dependencies.
+        const mux_host = b.addExecutable(.{ .name = "vertex-multiplexer-host", .root_module = b.createModule(.{
+            .root_source_file = b.path("src/multiplexer_host.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        mux_host.root_module.addImport("c", c_module);
+        mux_host.root_module.link_libc = true;
+        const mux_local = b.addSystemCommand(&.{ "python3", "tests/multiplexer_smoke.py" });
+        mux_local.addArtifactArg(mux_host);
+        mux_local.addArg("--require-multiplexers");
+        const mux_ssh = b.addSystemCommand(&.{ "python3", "tests/ssh_multiplexer_smoke.py" });
+        mux_ssh.addArtifactArg(mux_host);
+        mux_ssh.addArg("--require-multiplexers");
+        const mux_step = b.step("test-multiplexers", "Check standalone, tmux, Zellij and Herdr locally and over isolated SSH");
+        mux_step.dependOn(&mux_local.step);
+        mux_step.dependOn(&mux_ssh.step);
         configureLinux(exe.root_module, c_module, code);
         for (extra_codes) |extra| exe.root_module.addCSourceFile(.{ .file = extra });
         const integration = b.addTest(.{ .root_module = b.createModule(.{

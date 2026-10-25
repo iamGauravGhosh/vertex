@@ -9,3 +9,9 @@ pub fn milliseconds() i64 {
     _ = c.clock_gettime(c.CLOCK_MONOTONIC, &time);
     return time.tv_sec * 1000 + @divTrunc(time.tv_nsec, 1_000_000);
 }
+
+pub fn nanoseconds() i64 {
+    var time: c.timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &time);
+    return time.tv_sec * 1_000_000_000 + time.tv_nsec;
+}

@@ -47,6 +47,7 @@ The public API is:
 | `getCell(row, column)` | Return a cell by value, or null outside the grid |
 | `getRow(row)` | Return a borrowed `[]const Cell`, or null outside the grid |
 | `getCursor()` | Return cursor position and visibility by value |
+| `getRowGeneration(row)` | Return a content generation, or null outside the grid |
 | `getDamageRows()` | Borrow row flags accumulated since the last acknowledgment |
 | `clearDamage()` | Acknowledge damage after successful presentation |
 | `invalidateAll()` | Mark every row for repaint without changing cells |
@@ -110,13 +111,13 @@ ESC-prefixed sequences; its existing UTF-8 and recovery rules still apply.
 | --- | --- |
 | Printable scalar | Overwrite the cell, then advance; wrap is delayed until the next scalar |
 | BS, CR | Move left without erasing; move to the first column |
-| HT | Move to the next eight-column stop, clamped at the last column |
+| HT | Move to the next tab stop (every eight columns by default), clamped at the right edge |
 | LF, VT, FF; ESC `D` | Move down without changing column; scroll at the bottom margin |
 | ESC `E`, ESC `M` | Next line at column zero; reverse index, scrolling at the top margin |
 | CSI `A`, `B`, `C`, `D` | Relative cursor movement |
 | CSI `E`, `F` | Relative vertical movement followed by column zero |
 | CSI `G`, `d`, `H`, `f` | Absolute column, row, or row/column position |
-| ESC `7`/`8`; CSI `s`/`u` | Save/restore the same single cursor snapshot |
+| ESC `7`/`8`; CSI `s`/`u` | Save/restore one cursor snapshot; CSI `s` sets margins when mode 69 is enabled |
 | CSI `J`, `K` | Erase display/line: cursor to end (0), start through cursor (1), or all (2) |
 | CSI `X`, `@`, `P` | Erase, insert, or delete characters without crossing a row |
 | CSI `L`, `M` | Insert/delete rows from the cursor through the bottom margin |
@@ -147,6 +148,26 @@ Disabling wrap causes printing at the last column to overwrite that cell.
 Save/restore retains position, style, origin mode, autowrap, and pending wrap;
 visibility remains independent. Restore clamps saved rows to the current
 region when restoring origin mode.
+
+DEC G0/G1 ASCII and special-graphics designation (`ESC (` / `ESC )` with `B` or
+`0`), SI/SO, and saved charset state support legacy line drawing. ESC `H` sets
+a tab stop; CSI 0/3 `g` clears the current/all stops; CSI `I`/`Z` move forward/back
+through stops. Resize preserves existing stops and initializes new columns at
+eight-column intervals. CSI `b` repeats the preceding printed scalar, with work
+bounded to the cell count per command.
+
+CSI `Ps SP q` selects block (0–2), underline (3–4), or bar (5–6) cursor shapes.
+Blink variants render steadily. Cursor shape affects presentation damage without
+invalidating shaped text.
+
+Mode 69 enables horizontal margins, making CSI `left;right s` set the region
+instead of saving the cursor. Disabling it restores full-width margins. Origin
+addressing uses both margin pairs. Scrolling, line edits, and character insertion/
+deletion within the region preserve adjacent panes. Graphemes straddling a region
+boundary are erased as whole clusters before ownership moves. Resize resets both
+margin pairs. The row content generations change on every affected write/edit,
+even while damage remains pending. A unique read-only screen identity distinguishes
+main/alternate screens, resized storage, and temporary IME overlays.
 
 `Screen.reset()` does not reset the separate parser. To abandon a stream,
 reset both objects; use `Parser.finish()` to finalize a stream normally.
@@ -179,7 +200,7 @@ outside SGR are ignored as a whole command. `Screen` generates no replies; use `
 
 ## Limits and validation
 
-The model has no reflow, scrollback, custom tab stops, or images. Alternate
+The model has no reflow, scrollback, or images. Alternate
 screens are owned by `Session`. Screen storage stays in logical order; visual
 bidi ordering and font selection belong to the renderer. The Linux application connects it to Wayland GPU/CPU renderers
 and shell PTY; those dependencies are outside the public terminal module.

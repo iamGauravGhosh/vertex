@@ -14,6 +14,12 @@ and negotiated modern keyboard input are supported.
 
 The project also includes a reusable VT parser, a terminal screen model, and a
 command-line event tracer.
+
+Vertex works directly with your shell; multiplexers are optional. Run tmux,
+Zellij, or Herdr when you want tabs, split panes, layouts, or persistent sessions.
+Those features belong to the multiplexer. Vertex does not launch or install one
+automatically. See [multiplexer workflows and validation](docs/multiplexers.md)
+for local/SSH use, clipboard behavior, and performance measurements.
 The parser handles incremental UTF-8 text and ESC, CSI, OSC, DCS, and opt-in APC
 sequences without allocating memory. OSC/APC streaming hooks allow future image
 protocol consumers to process large transfers. The resizable screen model
@@ -104,6 +110,7 @@ Build commands (reserved for CI by the inherited repository instructions):
 ```sh
 zig build                  # Install the executable and Vertex's license
 zig build test             # Core, public-module, and headless Linux integration tests
+zig build test-multiplexers # Optional test dependencies: tmux, Zellij, Herdr, SSH
 zig build -Dgui=false      # Parser-only executable, without GUI dependencies
 python3 tests/cli_smoke.py zig-out/bin/vertex
 python3 tests/wayland_smoke.py zig-out/bin/vertex  # Private headless Weston instances
@@ -186,7 +193,14 @@ not advertised.
   screens. Legacy input remains the default. xterm modifyOtherKeys levels 0–2
   are used when Kitty enhancements are inactive.
 - Main/alternate screen modes 47/1047/1048/1049, application cursor/keypad modes,
-  basic device attributes, and status/cursor-position replies are supported.
+  device attributes, mode/capability/color/geometry queries, and status/cursor-position
+  replies are supported. DEC line drawing, tab stops, repeat characters, cursor
+  shapes, and horizontal scrolling margins support full-screen applications.
+- Synchronized output (2026) coalesces application redraws, with a 150 ms recovery
+  timeout. Output processing yields after 2 ms or 256 KiB so input remains responsive.
+- OSC 52 clipboard writes support application and multiplexer copying, including
+  over SSH. Decoding is streamed and capped at 8 MiB; clipboard reads are disabled.
+  Publishing waits for window focus and a valid Wayland input serial.
 
 Scrollback history, selection/copy UI, images, fractional-scale protocols, and
 full xterm compatibility remain future work. Resizing preserves the top-left

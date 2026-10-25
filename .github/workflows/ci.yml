@@ -48,13 +48,24 @@ jobs:
         with:
           version: 0.17.0
       - name: Install Linux GUI and smoke-test dependencies
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev wayland-protocols libxkbcommon-dev libfreetype-dev libfontconfig1-dev libharfbuzz-dev libfribidi-dev libegl1-mesa-dev libgles2-mesa-dev libwayland-egl-backend-dev libgl1-mesa-dri fonts-dejavu-core weston
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev wayland-protocols libxkbcommon-dev libfreetype-dev libfontconfig1-dev libharfbuzz-dev libfribidi-dev libegl1-mesa-dev libgles2-mesa-dev libwayland-egl-backend-dev libgl1-mesa-dri fonts-dejavu-core weston openssh-server libevent-dev libncurses-dev ncurses-term build-essential bison
+      - name: Install checksum-pinned multiplexer test tools
+        run: |
+          python3 tools/install_test_multiplexers.py "$RUNNER_TEMP/vertex-multiplexer-tools" --build-tmux
+          echo "$RUNNER_TEMP/vertex-multiplexer-tools" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/vertex-multiplexer-tools/tmux" -V
+          "$RUNNER_TEMP/vertex-multiplexer-tools/zellij" --version
+          "$RUNNER_TEMP/vertex-multiplexer-tools/herdr" --version
       - name: Check formatting
         run: zig fmt --check build.zig build.zig.zon src tests
       - name: Test Debug
         run: zig build test
       - name: Test ReleaseSafe
+        env:
+          VERTEX_BENCH: "1"
         run: zig build test -Doptimize=ReleaseSafe -Dcpu=baseline
+      - name: Check standalone and multiplexers locally and over SSH
+        run: zig build test-multiplexers -Doptimize=ReleaseSafe -Dcpu=baseline
       - name: Install executable and Vertex license
         run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
       - name: Check the installed CLI

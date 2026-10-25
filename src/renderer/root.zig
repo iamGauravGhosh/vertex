@@ -6,12 +6,9 @@ pub const Atlas = @import("Atlas.zig");
 pub const Damage = @import("Damage.zig");
 const Renderer = @This();
 
-pub const default_foreground: u32 = 0xd8dee9;
-pub const default_background: u32 = 0x15171a;
-const palette = [_]u32{
-    0x2e3440, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0,
-    0x4c566a, 0xd08770, 0xb5d99c, 0xffdf9e, 0x91b5d6, 0xc6a0c9, 0x9dd9e5, 0xffffff,
-};
+const Colors = @import("../terminal/Colors.zig");
+pub const default_foreground = Colors.foreground;
+pub const default_background = Colors.background;
 pub const Rect = struct { x: i32, y: i32, width: i32, height: i32 };
 pub const PositionedGlyph = struct {
     id: u32,
@@ -25,6 +22,9 @@ pub const PositionedGlyph = struct {
 const Face = struct { face: c.FT_Face, font: *c.hb_font_t, index: usize };
 const Row = struct {
     fingerprint: u64 = 0,
+    source: u64 = 0,
+    columns: usize = 0,
+    bidi: bool = false,
     visual: std.ArrayList(usize) = .empty,
     cells: std.ArrayList(vt.Cell) = .empty,
     glyphs: std.ArrayList(PositionedGlyph) = .empty,
@@ -47,6 +47,17 @@ atlas: Atlas,
 metrics: std.AutoHashMap(u64, Metrics),
 rows: []Row = &.{},
 shaped_rows: usize = 0,
+levels_scratch: std.ArrayList(c.FriBidiLevel) = .empty,
+scripts_scratch: std.ArrayList(c.hb_script_t) = .empty,
+font_cache: std.AutoHashMapUnmanaged(u21, usize) = .empty,
+raster_scratch: std.ArrayList(u8) = .empty,
+bidi_chars: std.ArrayList(c.FriBidiChar) = .empty,
+bidi_columns: std.ArrayList(usize) = .empty,
+bidi_types: std.ArrayList(c.FriBidiCharType) = .empty,
+bidi_brackets: std.ArrayList(c.FriBidiBracketType) = .empty,
+bidi_levels: std.ArrayList(c.FriBidiLevel) = .empty,
+bidi_map: std.ArrayList(c.FriBidiStrIndex) = .empty,
+bidi_seen: std.ArrayList(bool) = .empty,
 
 pub fn init(allocator: std.mem.Allocator) !Renderer {
     return initFont(allocator, "monospace");
@@ -116,6 +127,17 @@ fn clearRows(self: *Renderer) void {
 
 pub fn deinit(self: *Renderer) void {
     self.clearRows();
+    self.levels_scratch.deinit(self.allocator);
+    self.scripts_scratch.deinit(self.allocator);
+    self.font_cache.deinit(self.allocator);
+    self.raster_scratch.deinit(self.allocator);
+    self.bidi_chars.deinit(self.allocator);
+    self.bidi_columns.deinit(self.allocator);
+    self.bidi_types.deinit(self.allocator);
+    self.bidi_brackets.deinit(self.allocator);
+    self.bidi_levels.deinit(self.allocator);
+    self.bidi_map.deinit(self.allocator);
+    self.bidi_seen.deinit(self.allocator);
     self.atlas.deinit();
     self.metrics.deinit();
     c.hb_buffer_destroy(self.buffer);
@@ -146,18 +168,6 @@ pub fn setScale(self: *Renderer, scale: usize) !void {
     self.scale = scale;
 }
 
-fn scriptAt(cells: []const vt.Cell, at: usize, previous: c.hb_script_t) c.hb_script_t {
-    const unicode = c.hb_unicode_funcs_get_default();
-    const script = c.hb_unicode_script(unicode, cells[at].codepoint);
-    if (script != c.HB_SCRIPT_COMMON and script != c.HB_SCRIPT_INHERITED and script != c.HB_SCRIPT_UNKNOWN) return script;
-    if (previous != c.HB_SCRIPT_UNKNOWN) return previous;
-    for (cells[at + 1 ..]) |cell| {
-        const next = c.hb_unicode_script(unicode, cell.codepoint);
-        if (next != c.HB_SCRIPT_COMMON and next != c.HB_SCRIPT_INHERITED and next != c.HB_SCRIPT_UNKNOWN) return next;
-    }
-    return c.HB_SCRIPT_LATIN;
-}
-
 fn sizeFace(face: c.FT_Face, pixels: usize) !void {
     if (c.FT_Set_Pixel_Sizes(face, 0, @intCast(pixels)) == 0) return;
     if (face.*.num_fixed_sizes == 0) return error.FontSizeFailed;
@@ -175,6 +185,14 @@ fn supports(face: c.FT_Face, cluster: []const u21) bool {
     return true;
 }
 fn faceFor(self: *Renderer, cluster: []const u21) !usize {
+    if (cluster.len != 1) return self.findFace(cluster);
+    if (self.font_cache.get(cluster[0])) |face| return face;
+    const face = try self.findFace(cluster);
+    if (self.font_cache.count() >= 4096) self.font_cache.clearRetainingCapacity();
+    try self.font_cache.put(self.allocator, cluster[0], face);
+    return face;
+}
+fn findFace(self: *Renderer, cluster: []const u21) !usize {
     var emoji = false;
     for (cluster) |cp| if (cp == 0xfe0f or cp >= 0x1f000) {
         emoji = true;
@@ -220,17 +238,12 @@ fn faceFor(self: *Renderer, cluster: []const u21) !usize {
     for (self.faces.items, 0..) |face, i| if (supports(face.face, cluster)) return i + 1;
     if (emoji) {
         // Retry Fontconfig without the color preference.
-        const plain = try self.allocator.dupe(u21, cluster);
-        defer self.allocator.free(plain);
-        for (plain) |*cp| if (cp.* == 0xfe0f) {
-            cp.* = 0xfe0e;
-        };
         // The general search below does not apply a color requirement.
         for (0..@intCast(self.fallbacks.nfont)) |i| {
             var charset: ?*c.FcCharSet = null;
             if (c.FcPatternGetCharSet(self.fallbacks.fonts[i], c.FC_CHARSET, 0, &charset) != c.FcResultMatch) continue;
             var ok = true;
-            for (plain) |cp| if (cp != 0xfe0e and cp != 0x200d and c.FcCharSetHasChar(charset, cp) == 0) {
+            for (cluster) |cp| if (cp != 0xfe0f and cp != 0xfe0e and cp != 0x200d and c.FcCharSetHasChar(charset, cp) == 0) {
                 ok = false;
                 break;
             };
@@ -267,10 +280,10 @@ fn paragraph(screen: *const vt.Screen, row: usize) Paragraph {
 }
 fn resolveBidi(self: *Renderer, screen: *const vt.Screen, row: usize, output_levels: []c.FriBidiLevel, visual: []usize) !void {
     const bounds = paragraph(screen, row);
-    var chars: std.ArrayList(c.FriBidiChar) = .empty;
-    defer chars.deinit(self.allocator);
-    var columns: std.ArrayList(usize) = .empty;
-    defer columns.deinit(self.allocator);
+    const chars = &self.bidi_chars;
+    chars.clearRetainingCapacity();
+    const columns = &self.bidi_columns;
+    columns.clearRetainingCapacity();
     var line_start: usize = 0;
     var line_end: usize = 0;
     for (bounds.first..bounds.last) |r| {
@@ -285,22 +298,22 @@ fn resolveBidi(self: *Renderer, screen: *const vt.Screen, row: usize, output_lev
         if (r == row) line_end = chars.items.len;
     }
     if (chars.items.len == 0) return;
-    const types = try self.allocator.alloc(c.FriBidiCharType, chars.items.len);
-    defer self.allocator.free(types);
-    const brackets = try self.allocator.alloc(c.FriBidiBracketType, chars.items.len);
-    defer self.allocator.free(brackets);
-    const levels = try self.allocator.alloc(c.FriBidiLevel, chars.items.len);
-    defer self.allocator.free(levels);
-    const map = try self.allocator.alloc(c.FriBidiStrIndex, chars.items.len);
-    defer self.allocator.free(map);
+    try self.bidi_types.resize(self.allocator, chars.items.len);
+    const types = self.bidi_types.items;
+    try self.bidi_brackets.resize(self.allocator, chars.items.len);
+    const brackets = self.bidi_brackets.items;
+    try self.bidi_levels.resize(self.allocator, chars.items.len);
+    const levels = self.bidi_levels.items;
+    try self.bidi_map.resize(self.allocator, chars.items.len);
+    const map = self.bidi_map.items;
     for (map, 0..) |*entry, i| entry.* = @intCast(i);
     c.fribidi_get_bidi_types(chars.items.ptr, @intCast(chars.items.len), types.ptr);
     c.fribidi_get_bracket_types(chars.items.ptr, @intCast(chars.items.len), types.ptr, brackets.ptr);
     var direction: c.FriBidiParType = c.FRIBIDI_PAR_ON;
     if (c.fribidi_get_par_embedding_levels_ex(types.ptr, brackets.ptr, @intCast(chars.items.len), &direction, levels.ptr) == 0) return error.OutOfMemory;
     if (c.fribidi_reorder_line(0, types.ptr, @intCast(line_end - line_start), @intCast(line_start), direction, levels.ptr, null, map.ptr) == 0) return error.OutOfMemory;
-    const seen = try self.allocator.alloc(bool, screen.columns);
-    defer self.allocator.free(seen);
+    try self.bidi_seen.resize(self.allocator, screen.columns);
+    const seen = self.bidi_seen.items;
     @memset(seen, false);
     var next: usize = 0;
     for (map[line_start..line_end]) |logical| {
@@ -327,37 +340,50 @@ pub fn shapeRow(self: *Renderer, screen: *const vt.Screen, index: usize) ![]cons
     }
     const row = &self.rows[index];
     const cells = screen.getRow(index).?;
-    var hash = std.hash.Wyhash.init(0);
-    const bounds: Paragraph = if (self.bidi) paragraph(screen, index) else .{ .first = index, .last = index + 1 };
-    for (screen.cells[bounds.first * screen.columns .. bounds.last * screen.columns]) |cell| {
-        std.hash.autoHash(&hash, cell.codepoint);
-        std.hash.autoHash(&hash, cell.width);
-        std.hash.autoHash(&hash, cell.style);
-        hash.update(std.mem.sliceAsBytes(cell.grapheme));
+    var fingerprint = screen.row_generations[index];
+    if (self.bidi) {
+        var hash = std.hash.Wyhash.init(0);
+        const bounds = paragraph(screen, index);
+        hash.update(std.mem.sliceAsBytes(screen.row_generations[bounds.first..bounds.last]));
+        std.hash.autoHash(&hash, bounds.first);
+        std.hash.autoHash(&hash, bounds.last);
+        fingerprint = hash.final();
     }
-    std.hash.autoHash(&hash, self.bidi);
-    std.hash.autoHash(&hash, bounds.first);
-    std.hash.autoHash(&hash, bounds.last);
-    std.hash.autoHash(&hash, index);
-    const fingerprint = hash.final();
-    if (row.valid and row.fingerprint == fingerprint) return row.glyphs.items;
+    if (row.valid and row.source == screen.identity and row.columns == screen.columns and row.bidi == self.bidi and row.fingerprint == fingerprint) return row.glyphs.items;
     row.valid = false;
     row.glyphs.clearRetainingCapacity();
     try row.visual.resize(self.allocator, cells.len);
     for (row.visual.items, 0..) |*col, i| col.* = i;
-    const levels = try self.allocator.alloc(c.FriBidiLevel, cells.len);
-    defer self.allocator.free(levels);
+    try self.levels_scratch.resize(self.allocator, cells.len);
+    const levels = self.levels_scratch.items;
+    try self.scripts_scratch.resize(self.allocator, cells.len);
+    const scripts = self.scripts_scratch.items;
+    // Classify once in reverse, then inherit previous script in one forward pass.
+    var following: c.hb_script_t = c.HB_SCRIPT_LATIN;
+    var reverse = cells.len;
+    while (reverse > 0) {
+        reverse -= 1;
+        const script = c.hb_unicode_script(c.hb_unicode_funcs_get_default(), cells[reverse].codepoint);
+        const common = script == c.HB_SCRIPT_COMMON or script == c.HB_SCRIPT_INHERITED or script == c.HB_SCRIPT_UNKNOWN;
+        if (!common) following = script;
+        scripts[reverse] = if (common) following else script;
+    }
+    var previous: c.hb_script_t = c.HB_SCRIPT_UNKNOWN;
+    for (cells, 0..) |cell, i| {
+        const script = c.hb_unicode_script(c.hb_unicode_funcs_get_default(), cell.codepoint);
+        const common = script == c.HB_SCRIPT_COMMON or script == c.HB_SCRIPT_INHERITED or script == c.HB_SCRIPT_UNKNOWN;
+        if (common and previous != c.HB_SCRIPT_UNKNOWN) scripts[i] = previous;
+        if (cell.width != 0) previous = scripts[i];
+    }
     @memset(levels, 0);
     if (self.bidi) try self.resolveBidi(screen, index, levels, row.visual.items);
     var start: usize = 0;
-    var previous: c.hb_script_t = c.HB_SCRIPT_UNKNOWN;
     while (start < cells.len) {
         if (cells[start].width == 0) {
             start += 1;
             continue;
         }
-        const script = scriptAt(cells, start, previous);
-        previous = script;
+        const script = scripts[start];
         const face_index = try self.faceFor(screen.getGrapheme(index, start).?);
         const selected = self.fontFace(face_index);
         const rtl = @mod(levels[start], 2) == 1;
@@ -367,7 +393,7 @@ pub fn shapeRow(self: *Renderer, screen: *const vt.Screen, index: usize) ![]cons
                 end += 1;
                 continue;
             }
-            if (!std.meta.eql(cells[end].style, cells[start].style) or scriptAt(cells, end, script) != script or @mod(levels[end], 2) != @mod(levels[start], 2) or try self.faceFor(screen.getGrapheme(index, end).?) != face_index) break;
+            if (!std.meta.eql(cells[end].style, cells[start].style) or scripts[end] != script or @mod(levels[end], 2) != @mod(levels[start], 2) or try self.faceFor(screen.getGrapheme(index, end).?) != face_index) break;
             end += cells[end].width;
         }
         c.hb_buffer_reset(self.buffer);
@@ -416,11 +442,15 @@ pub fn shapeRow(self: *Renderer, screen: *const vt.Screen, index: usize) ![]cons
         start = end;
     }
     row.fingerprint = fingerprint;
+    row.source = screen.identity;
+    row.columns = screen.columns;
+    row.bidi = self.bidi;
     row.valid = true;
     self.shaped_rows += 1;
     return row.glyphs.items;
 }
 pub fn visualColumn(self: *Renderer, screen: *const vt.Screen, row: usize, column: usize) !usize {
+    if (!self.bidi) return column;
     _ = try self.shapeRow(screen, row);
     return self.visualCached(screen, row, column);
 }
@@ -468,10 +498,17 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
         try painter.fill(.{ .x = 0, .y = y, .width = @intCast(painter.width), .height = @intCast(ch) }, default_background);
         const cells = screen.getRow(row).?;
         const glyphs = try self.shapeRow(screen, row);
-        for (cells, 0..) |cell, col| {
-            const rgb = colors(cell.style, cursor.visible and cursor.row == row and cursor.column == col);
-            const x: i32 = @intCast(self.visualCached(screen, row, col) * cw);
-            try painter.fill(.{ .x = x, .y = y, .width = @intCast(cw), .height = @intCast(ch) }, rgb.bg);
+        var background_col: usize = 0;
+        while (background_col < cells.len) {
+            const rgb = colors(cells[background_col].style, cursor.visible and cursor.shape == .block and cursor.row == row and cursor.column == background_col);
+            const x = self.visualCached(screen, row, background_col);
+            var end = background_col + 1;
+            while (end < cells.len) : (end += 1) {
+                const next = colors(cells[end].style, cursor.visible and cursor.shape == .block and cursor.row == row and cursor.column == end);
+                if (next.bg != rgb.bg or self.visualCached(screen, row, end) != x + end - background_col) break;
+            }
+            try painter.fill(.{ .x = @intCast(x * cw), .y = y, .width = @intCast((end - background_col) * cw), .height = @intCast(ch) }, rgb.bg);
+            background_col = end;
         }
         for (glyphs) |g| {
             if (g.style.hidden) continue;
@@ -500,8 +537,8 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
                         // Only a bounded tile scratch buffer, including for very large glyphs.
                         const is_color = bitmap.pixel_mode == c.FT_PIXEL_MODE_BGRA;
                         const channels: usize = if (is_color) 4 else 1;
-                        const scratch = try self.allocator.alloc(u8, tw * th * channels);
-                        defer self.allocator.free(scratch);
+                        try self.raster_scratch.resize(self.allocator, tw * th * channels);
+                        const scratch = self.raster_scratch.items;
                         const pitch: usize = @intCast(@abs(bitmap.pitch));
                         for (0..th) |by| {
                             const original_y = (ty + by) * bitmap.rows / m.height;
@@ -530,7 +567,7 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
                     const dy: i32 = @intCast(y + self.ascent * @as(i32, @intCast(self.scale)) - m.top + @divFloor(g.y, 64) + @as(i64, @intCast(ty)));
                     // Per-cell clips preserve cursor colors even inside a single ligature.
                     for (g.column..g.end) |col| {
-                        const rgb = colors(g.style, cursor.visible and cursor.row == row and cursor.column == col);
+                        const rgb = colors(g.style, cursor.visible and cursor.shape == .block and cursor.row == row and cursor.column == col);
                         try painter.mask(&self.atlas, region, dx, dy, .{ .x = @intCast(self.visualCached(screen, row, col) * cw), .y = y, .width = @intCast(cw), .height = @intCast(ch) }, rgb.fg);
                     }
                 }
@@ -538,7 +575,7 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
         }
         for (cells, 0..) |cell, col| {
             if (cell.style.hidden) continue;
-            const rgb = colors(cell.style, cursor.visible and cursor.row == row and cursor.column == col);
+            const rgb = colors(cell.style, cursor.visible and cursor.shape == .block and cursor.row == row and cursor.column == col);
             const x: i32 = @intCast(self.visualCached(screen, row, col) * cw);
             const baseline: usize = @intCast(@max(0, self.ascent));
             if (cell.style.underline) {
@@ -549,6 +586,12 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
                 const line = @min(ch - 1, baseline / 2 * self.scale);
                 try painter.fill(.{ .x = x, .y = y + @as(i32, @intCast(line)), .width = @intCast(cw), .height = @intCast(@min(self.scale, ch - line)) }, rgb.fg);
             }
+        }
+        if (cursor.visible and cursor.shape != .block and cursor.row == row) {
+            const x: i32 = @intCast(self.visualCached(screen, row, cursor.column) * cw);
+            const rgb = colors(cells[cursor.column].style, false);
+            const thickness = @min(2 * self.scale, if (cursor.shape == .bar) cw else ch);
+            try painter.fill(.{ .x = x, .y = y + @as(i32, @intCast(if (cursor.shape == .underline) ch - thickness else 0)), .width = @intCast(if (cursor.shape == .bar) thickness else cw), .height = @intCast(if (cursor.shape == .underline) thickness else ch) }, rgb.fg);
         }
     }
     try painter.flush();
@@ -615,11 +658,7 @@ pub fn color(value: vt.Color, default: u32) u32 {
     return switch (value) {
         .default => default,
         .rgb => |rgb| (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | rgb.b,
-        .indexed => |index| if (index < 16) palette[index] else if (index >= 232) @as(u32, 8 + (index - 232) * 10) * 0x010101 else cube: {
-            const n: u32 = index - 16;
-            const levels = [_]u32{ 0, 95, 135, 175, 215, 255 };
-            break :cube (levels[n / 36] << 16) | (levels[n / 6 % 6] << 8) | levels[n % 6];
-        },
+        .indexed => |index| Colors.indexed(index),
     };
 }
 

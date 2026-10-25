@@ -42,6 +42,7 @@ const Buffer = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, command: []const []const u8) !u8 {
+    _ = c.signal(c.SIGPIPE, c.SIG_IGN);
     const mode_name = c.getenv("VERTEX_RENDERER");
     const mode = Gpu.Mode.parse(if (mode_name != null) std.mem.span(mode_name) else null) catch {
         std.debug.print("vertex: VERTEX_RENDERER must be auto, gpu, or cpu\n", .{});
@@ -84,7 +85,7 @@ const App = struct {
     backend_started: bool = false,
     damage: ?Renderer.Damage = null,
     pixels: []u32 = &.{},
-    parser: vt.Parser = vt.Parser.init(),
+    parser: vt.Parser = vt.Parser.initWithOptions(.{ .osc_mode = .streaming }),
     pty: ?Pty = null,
     pty_eof: bool = false,
     display: ?*c.wl_display = null,
@@ -191,6 +192,7 @@ const App = struct {
             if (self.configured) {
                 try self.applySize();
                 if (self.pty == null) self.pty = try Pty.spawn(self.allocator, command, self.screen.rows, self.screen.columns);
+                try self.flushInput();
                 try self.drainPty();
                 if (try self.pty.?.pollExit()) |status| {
                     // Reap the child independently of descendants retaining the slave.
@@ -199,6 +201,9 @@ const App = struct {
                     return status;
                 }
                 try self.flushInput();
+                self.clipboard.focused = self.focused;
+                try self.clipboard.publish();
+                self.clipboard.pump();
                 try self.draw();
             }
             while (c.wl_display_prepare_read(self.display) != 0) {
@@ -216,8 +221,17 @@ const App = struct {
                 .{ .fd = if (self.pty != null and !self.pty_eof) self.pty.?.master else -1, .events = @as(c_short, c.POLLIN) | (if (self.pending.items.len > 0) @as(c_short, c.POLLOUT) else 0), .revents = 0 },
                 .{ .fd = self.repeat_fd, .events = c.POLLIN, .revents = 0 },
                 .{ .fd = self.clipboard.fd, .events = c.POLLIN, .revents = 0 },
+                .{ .fd = -1, .events = c.POLLOUT, .revents = 0 },
+                .{ .fd = -1, .events = c.POLLOUT, .revents = 0 },
+                .{ .fd = -1, .events = c.POLLOUT, .revents = 0 },
+                .{ .fd = -1, .events = c.POLLOUT, .revents = 0 },
             };
-            const result = c.poll(&fds, fds.len, 100);
+            for (self.clipboard.transfers, 0..) |slot, i| if (slot) |transfer| {
+                fds[4 + i].fd = transfer.fd;
+            };
+            var timeout: c_int = 100;
+            if (self.session.sync_deadline_ms) |deadline| timeout = @intCast(std.math.clamp(deadline - common.milliseconds(), 0, timeout));
+            const result = c.poll(&fds, fds.len, timeout);
             if (result < 0) {
                 if (common.errno() == c.EINTR) continue;
                 return error.PollFailed;
@@ -269,6 +283,7 @@ const App = struct {
         try self.session.resize(rows, columns);
         if (self.pty) |*pty| try pty.resize(rows, columns);
         try self.renderer.setScale(self.scale);
+        self.session.geometry = .{ .width = self.width * self.scale, .height = self.height * self.scale, .cell_width = self.renderer.cell_width * self.scale, .cell_height = self.renderer.cell_height * self.scale };
         c.wl_surface_set_buffer_scale(self.surface, @intCast(self.scale));
         for (self.buffers.items) |buffer| {
             if (buffer.width != self.width * self.scale or buffer.height != self.height * self.scale or buffer.pending_rows.len != self.screen.rows) buffer.retired = true;
@@ -280,10 +295,11 @@ const App = struct {
 
     fn drainPty(self: *App) !void {
         if (self.pty_eof) return;
-        var bytes: [16384]u8 = undefined;
+        var bytes: [4096]u8 = undefined;
         var budget: usize = 256 * 1024;
+        const deadline = common.nanoseconds() + 2_000_000;
         while (budget > 0) {
-            const count = self.pty.?.read(&bytes) catch |err| switch (err) {
+            const count = self.pty.?.read(bytes[0..@min(bytes.len, budget)]) catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => return err,
             };
@@ -291,11 +307,15 @@ const App = struct {
                 self.pty_eof = true;
                 return;
             }
+            _ = self.session.presentationHeld(common.milliseconds());
             self.parser.feed(bytes[0..count], &self.session);
             if (self.session.takeError()) |err| return err;
             try self.queue(self.session.replies.items);
             self.session.replies.clearRetainingCapacity();
+            if (self.session.takeClipboard()) |text| self.clipboard.set(text);
+            try self.flushInput();
             budget -= count;
+            if (common.nanoseconds() >= deadline) return;
         }
     }
 
@@ -334,7 +354,7 @@ const App = struct {
 
     fn draw(self: *App) !void {
         self.collectBuffers();
-        if (self.frame != null) return;
+        if (self.frame != null or self.session.presentationHeld(common.milliseconds())) return;
         if (self.renderer.bidi) {
             for (self.screen.getDamageRows()) |dirty| if (dirty) {
                 self.screen.invalidateAll();
@@ -830,6 +850,8 @@ fn keyboardLeave(data: ?*anyopaque, _: ?*c.wl_keyboard, _: u32, _: ?*c.wl_surfac
         self.failure = err;
     };
     self.focused = false;
+    self.clipboard.focused = false;
+    self.clipboard.serial = null;
     self.clipboard.cancel();
     self.pressed = @splat(null);
     self.physical_down = @splat(false);
@@ -837,8 +859,9 @@ fn keyboardLeave(data: ?*anyopaque, _: ?*c.wl_keyboard, _: u32, _: ?*c.wl_surfac
     self.stopRepeat();
     if (self.compose_state) |state| c.xkb_compose_state_reset(state);
 }
-fn keyboardKey(data: ?*anyopaque, _: ?*c.wl_keyboard, _: u32, _: u32, raw_key: u32, state: u32) callconv(.c) void {
+fn keyboardKey(data: ?*anyopaque, _: ?*c.wl_keyboard, serial: u32, _: u32, raw_key: u32, state: u32) callconv(.c) void {
     const self = appFrom(data);
+    if (state == c.WL_KEYBOARD_KEY_STATE_PRESSED) self.clipboard.serial = serial;
     const key = raw_key + 8;
     if (key < self.physical_down.len) self.physical_down[key] = state == c.WL_KEYBOARD_KEY_STATE_PRESSED;
     if (state == c.WL_KEYBOARD_KEY_STATE_RELEASED) {
@@ -919,7 +942,7 @@ fn pointerMotion(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, x: c.wl_fixed_t, 
     const button: u8 = if (self.pointer_buttons & 1 != 0) 0 else if (self.pointer_buttons & 2 != 0) 1 else if (self.pointer_buttons & 4 != 0) 2 else 3;
     sendPointer(self, .motion, button);
 }
-fn pointerButton(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: u32, button: u32, state: u32) callconv(.c) void {
+fn pointerButton(data: ?*anyopaque, _: ?*c.wl_pointer, serial: u32, _: u32, button: u32, state: u32) callconv(.c) void {
     const self = appFrom(data);
     const number: u8 = switch (button) {
         0x110 => 0,
@@ -928,6 +951,7 @@ fn pointerButton(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: u32, button: u
         else => return,
     };
     const pressed = state == c.WL_POINTER_BUTTON_STATE_PRESSED;
+    if (pressed) self.clipboard.serial = serial;
     const bit = @as(u8, 1) << @intCast(number);
     if (pressed) self.pointer_buttons |= bit else self.pointer_buttons &= ~bit;
     if (number == 1 and pressed and (self.session.modes.mouse_tracking == 0 or self.modifiers().shift)) {
@@ -1112,4 +1136,47 @@ test "auto GPU failure preserves damage and forced GPU failures propagate" {
     try std.testing.expectError(error.EglContextLost, app.disableGpu(error.EglContextLost));
     app.mode = .auto;
     try std.testing.expectError(error.OutOfMemory, app.disableGpu(error.OutOfMemory));
+}
+
+test "benchmark keyboard handler to PTY during continuous output" {
+    if (c.getenv("VERTEX_BENCH") == null) return error.SkipZigTest;
+    const t = std.testing;
+    var app: App = .{
+        .allocator = t.allocator,
+        .renderer = undefined,
+        .screen = undefined,
+        .session = try vt.Session.init(t.allocator, 48, 160),
+        .focused = true,
+    };
+    defer app.session.deinit();
+    defer app.pending.deinit(t.allocator);
+    app.screen = app.session.activeScreen();
+    app.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbFailed;
+    defer c.xkb_context_unref(app.xkb_context);
+    var names = std.mem.zeroes(c.xkb_rule_names);
+    names.layout = "us";
+    app.keymap = c.xkb_keymap_new_from_names(app.xkb_context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbFailed;
+    defer c.xkb_keymap_unref(app.keymap);
+    app.key_state = c.xkb_state_new(app.keymap) orelse return error.XkbFailed;
+    defer c.xkb_state_unref(app.key_state);
+    app.pty = try Pty.spawn(t.allocator, &.{ "/bin/sh", "-c", "stty raw -echo; yes 'continuous log output' & cat >/dev/null" }, 48, 160);
+    defer app.pty.?.deinit();
+    var ready = c.pollfd{ .fd = app.pty.?.master, .events = c.POLLIN, .revents = 0 };
+    try t.expect(c.poll(&ready, 1, 1000) > 0);
+    var samples: [200]i64 = undefined;
+    for (0..220) |iteration| {
+        try app.drainPty();
+        const start = common.nanoseconds();
+        keyboardKey(&app, null, 1, 0, 30, c.WL_KEYBOARD_KEY_STATE_PRESSED);
+        if (app.failure) |err| return err;
+        try t.expect(app.pending.items.len > app.pending_offset);
+        try app.flushInput();
+        try t.expectEqual(@as(usize, 0), app.pending.items.len);
+        const elapsed = common.nanoseconds() - start;
+        keyboardKey(&app, null, 1, 0, 30, c.WL_KEYBOARD_KEY_STATE_RELEASED);
+        if (iteration >= 20) samples[iteration - 20] = elapsed;
+    }
+    std.mem.sort(i64, &samples, {}, std.sort.asc(i64));
+    try t.expect(app.screen.revision > 1000); // the producer actually ran
+    std.debug.print("\nvertex benchmark: Wayland key handler -> PTY write during continuous output; p50={d}us p95={d}us p99={d}us (excludes compositor/app/network latency)\n", .{ @divTrunc(samples[100], 1000), @divTrunc(samples[190], 1000), @divTrunc(samples[198], 1000) });
 }

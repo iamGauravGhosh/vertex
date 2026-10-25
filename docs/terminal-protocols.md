@@ -7,7 +7,10 @@ Kitty stacks, and an ordered reply queue. It has no libc or GUI dependencies.
 ```zig
 var session = try vt.Session.init(allocator, 24, 80);
 defer session.deinit();
-var parser = vt.Parser.init();
+var parser = vt.Parser.initWithOptions(.{ .osc_mode = .streaming });
+// Set the host's monotonic clock before feeding output; wake at sync_deadline_ms.
+const held = session.presentationHeld(now_ms);
+_ = held;
 parser.feed(output_bytes, &session);
 if (session.takeError()) |err| return err;
 try session.drainReplies(writer);
@@ -23,6 +26,24 @@ RIS (`ESC c`) resets both screens, negotiated modes, and stacks. Reply draining
 acknowledges bytes only after the writer succeeds; a writer that partially writes
 before failing must not retry the whole queue without accounting for its progress.
 The Linux adapter moves replies into its nonblocking PTY queue before draining.
+
+`presentationHeld(now_ms)` updates the host-supplied monotonic clock and reports
+whether presentation should wait. Mode 2026 holds presentation for at most 150 ms;
+the host must poll its deadline even when output stops. Repeated begins do not
+extend the deadline. After timeout, further begins are ignored until an explicit
+end or RIS. Parsing, input, replies, and clipboard handling continue during a hold.
+Damage is acknowledged only after a successful presentation.
+
+Set `session.geometry` from the host's current surface and cell sizes in physical
+pixels. CSI 14/16/18 `t` query surface pixels, cell pixels, and terminal rows/columns.
+Unset pixel geometry produces no fabricated reply. DECRQM reports implemented
+private modes as set/reset and unknown modes as unrecognized. Secondary device
+attributes identify a conservative VT100 class rather than claiming VT420 support.
+XTGETTCAP handles `TN`, `Co`/`colors`, `RGB`/`Tc`, `Ms`, and `Sync`; unknown names
+receive a failure reply. DECRQSS reports vertical/horizontal margins and cursor
+shape; other status strings receive a failure reply. These are bounded handlers,
+not general DCS passthrough. OSC 4, 10, and 11 queries use the renderer's shared
+palette and defaults; palette mutation is not implemented.
 
 Input modes include DEC application cursor/keypad, focus, bracketed paste, and
 mouse tracking/encoding. `Session` applies DECSET/DECRST, alternate screens
@@ -49,6 +70,21 @@ endings to CR, and conditionally adds mode-2004 framing. The Linux clipboard
 receiver caps transfers at 8 MiB and waits for EOF before enqueueing. Queue write
 offsets preserve order across short writes and `EAGAIN`. Focus loss cancels an
 unfinished clipboard receive.
+
+With streaming OSC enabled, `takeClipboard()` transfers ownership of the newest
+complete OSC 52 write (`c` or empty selection) as an optional owned byte slice.
+The host must free it, including an empty slice used to clear the clipboard.
+Standard padded base64 is decoded incrementally up to 8 MiB. Invalid, oversized,
+cancelled, interrupted, and incomplete writes never replace the previous complete
+write. Queries (`?`) and other selection targets are ignored. Buffered parser
+consumers also support small writes within the parser's existing 4096-byte limit.
+The GUI enables streaming; the event-trace CLI keeps its previous defaults.
+
+Wayland publication waits for focus and a valid keyboard/button input serial;
+focus loss clears that serial. Clipboard sources advertise UTF-8 plain text.
+At most four asynchronous sends are active, sharing a 64 KiB write budget per
+event-loop turn. Each owns its bytes so replacing a source cannot invalidate an
+in-flight send. Slow or closed recipients do not block keyboard/PTY processing.
 
 Unicode segmentation data and its conformance fixture are pinned to 15.1.0.
 Regenerate with `python3 tools/generate_unicode.py /path/to/UCD.zip`. Generated

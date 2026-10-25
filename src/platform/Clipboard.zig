@@ -10,6 +10,12 @@ const Offer = struct {
     primary: ?*c.zwp_primary_selection_offer_v1 = null,
     mime: ?[:0]const u8 = null,
 };
+const Source = struct {
+    clipboard: *Clipboard,
+    object: *c.wl_data_source,
+    bytes: []u8,
+};
+const Transfer = struct { fd: c_int, bytes: []u8, offset: usize = 0 };
 allocator: std.mem.Allocator,
 manager: ?*c.wl_data_device_manager = null,
 primary_manager: ?*c.zwp_primary_selection_device_manager_v1 = null,
@@ -21,6 +27,69 @@ primary_selection: ?*Offer = null,
 fd: c_int = -1,
 bytes: std.ArrayList(u8) = .empty,
 failure: ?anyerror = null,
+source: ?*Source = null,
+outgoing: ?[]u8 = null,
+serial: ?u32 = null,
+focused: bool = false,
+transfers: [4]?Transfer = @splat(null),
+
+/// Takes ownership, keeping only the newest complete application clipboard write.
+pub fn set(self: *Clipboard, bytes: []u8) void {
+    if (self.outgoing) |old| self.allocator.free(old);
+    self.outgoing = bytes;
+}
+/// A fresh input serial is required after focus is acquired. Never invent one.
+pub fn publish(self: *Clipboard) !void {
+    if (!self.focused or self.serial == null or self.outgoing == null or self.manager == null or self.device == null) return;
+    const object = c.wl_data_device_manager_create_data_source(self.manager) orelse return error.WaylandObjectFailed;
+    errdefer c.wl_data_source_destroy(object);
+    const source = try self.allocator.create(Source);
+    errdefer self.allocator.destroy(source);
+    source.* = .{ .clipboard = self, .object = object, .bytes = self.outgoing.? };
+    if (c.wl_data_source_add_listener(object, &data_source_listener, source) != 0) return error.WaylandListenerFailed;
+    c.wl_data_source_offer(object, "text/plain;charset=utf-8");
+    c.wl_data_source_offer(object, "UTF8_STRING");
+    c.wl_data_source_offer(object, "text/plain");
+    c.wl_data_device_set_selection(self.device, object, self.serial.?);
+    if (self.source) |old| self.destroySource(old);
+    self.source = source;
+    self.outgoing = null;
+}
+fn destroySource(self: *Clipboard, source: *Source) void {
+    c.wl_data_source_destroy(source.object);
+    self.allocator.free(source.bytes);
+    self.allocator.destroy(source);
+}
+fn finishTransfer(self: *Clipboard, slot: *?Transfer) void {
+    if (slot.*) |transfer| {
+        _ = c.close(transfer.fd);
+        self.allocator.free(transfer.bytes);
+        slot.* = null;
+    }
+}
+/// Bounded writes; the event loop polls these descriptors for POLLOUT.
+pub fn pump(self: *Clipboard) void {
+    var budget: usize = 64 * 1024;
+    for (&self.transfers) |*slot| {
+        if (slot.*) |*transfer| {
+            while (transfer.offset < transfer.bytes.len and budget > 0) {
+                // Wayland recipients can close pipes at any time. Linux returns
+                // EPIPE; SIGPIPE is ignored by the parent (reset in the PTY child).
+                const n = c.write(transfer.fd, transfer.bytes[transfer.offset..].ptr, @min(budget, transfer.bytes.len - transfer.offset));
+                if (n < 0) {
+                    if (common.errno() == c.EINTR) continue;
+                    if (common.errno() != c.EAGAIN) self.finishTransfer(slot);
+                    break;
+                }
+                if (n == 0) break;
+                const count: usize = @intCast(n);
+                transfer.offset += count;
+                budget -= count;
+            }
+        }
+        if (slot.*) |transfer| if (transfer.offset == transfer.bytes.len) self.finishTransfer(slot);
+    }
+}
 
 pub fn setup(self: *Clipboard, seat: ?*c.wl_seat) void {
     if (seat == null) return;
@@ -82,6 +151,9 @@ fn destroyOffer(self: *Clipboard, offer: *Offer) void {
 }
 pub fn deinit(self: *Clipboard) void {
     self.cancel();
+    for (&self.transfers) |*slot| self.finishTransfer(slot);
+    if (self.source) |source| self.destroySource(source);
+    if (self.outgoing) |bytes| self.allocator.free(bytes);
     for (self.offers.items) |offer| self.destroyOffer(offer);
     self.offers.deinit(self.allocator);
     self.bytes.deinit(self.allocator);
@@ -223,3 +295,75 @@ test "oversized clipboard transfer is discarded before it reaches the PTY" {
 }
 
 fn sourceActions(_: ?*anyopaque, _: ?*c.wl_data_offer, _: u32) callconv(.c) void {}
+
+fn sourceTarget(_: ?*anyopaque, _: ?*c.wl_data_source, _: [*c]const u8) callconv(.c) void {}
+fn sourceSend(data: ?*anyopaque, _: ?*c.wl_data_source, mime: [*c]const u8, fd: i32) callconv(.c) void {
+    const source: *Source = @ptrCast(@alignCast(data.?));
+    const self = source.clipboard;
+    const name = std.mem.span(mime);
+    if (std.mem.eql(u8, name, "text/plain;charset=utf-8") or std.mem.eql(u8, name, "UTF8_STRING") or std.mem.eql(u8, name, "text/plain")) {
+        for (&self.transfers) |*slot| if (slot.* == null) {
+            const flags = c.fcntl(fd, c.F_GETFL);
+            if (flags < 0 or c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK) < 0) break;
+            const bytes = self.allocator.dupe(u8, source.bytes) catch break;
+            slot.* = .{ .fd = fd, .bytes = bytes };
+            return;
+        };
+    }
+    _ = c.close(fd);
+}
+fn sourceCancelled(data: ?*anyopaque, _: ?*c.wl_data_source) callconv(.c) void {
+    const source: *Source = @ptrCast(@alignCast(data.?));
+    const self = source.clipboard;
+    if (self.source == source) self.source = null;
+    self.destroySource(source);
+}
+fn sourceDrop(_: ?*anyopaque, _: ?*c.wl_data_source) callconv(.c) void {}
+fn sourceAction(_: ?*anyopaque, _: ?*c.wl_data_source, _: u32) callconv(.c) void {}
+const data_source_listener: c.wl_data_source_listener = .{ .target = sourceTarget, .send = sourceSend, .cancelled = sourceCancelled, .dnd_drop_performed = sourceDrop, .dnd_finished = sourceDrop, .action = sourceAction };
+
+test "clipboard source sends are bounded nonblocking and survive source replacement" {
+    const t = std.testing;
+    var clipboard: Clipboard = .{ .allocator = t.allocator };
+    defer clipboard.deinit();
+    var source: Source = .{ .clipboard = &clipboard, .object = undefined, .bytes = try t.allocator.alloc(u8, 256 * 1024) };
+    @memset(source.bytes, 'x');
+    var fds: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.pipe2(&fds, c.O_CLOEXEC | c.O_NONBLOCK));
+    defer _ = c.close(fds[0]);
+    sourceSend(&source, null, "text/plain;charset=utf-8", fds[1]);
+    t.allocator.free(source.bytes); // replacing/cancelling the source cannot invalidate a send
+    clipboard.pump();
+    try t.expect(clipboard.transfers[0] != null);
+    try t.expect(clipboard.transfers[0].?.offset <= 64 * 1024);
+    var count: usize = 0;
+    var buffer: [16384]u8 = undefined;
+    for (0..1024) |_| {
+        const n = c.read(fds[0], &buffer, buffer.len);
+        if (n > 0) {
+            count += @intCast(n);
+            for (buffer[0..@intCast(n)]) |byte| try t.expectEqual(@as(u8, 'x'), byte);
+        } else if (n == 0) break;
+        clipboard.pump();
+    }
+    try t.expectEqual(@as(usize, 256 * 1024), count);
+    try t.expect(clipboard.transfers[0] == null);
+}
+
+test "clipboard writes wait for focus and a valid serial and discard closed recipients" {
+    const t = std.testing;
+    var clipboard: Clipboard = .{ .allocator = t.allocator };
+    defer clipboard.deinit();
+    clipboard.set(try t.allocator.dupe(u8, "old"));
+    clipboard.set(try t.allocator.dupe(u8, "new"));
+    try clipboard.publish();
+    try t.expectEqualStrings("new", clipboard.outgoing.?);
+    var fds: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.pipe2(&fds, c.O_CLOEXEC | c.O_NONBLOCK));
+    _ = c.close(fds[0]);
+    clipboard.transfers[0] = .{ .fd = fds[1], .bytes = try t.allocator.dupe(u8, "cancelled") };
+    const previous = c.signal(c.SIGPIPE, c.SIG_IGN);
+    defer _ = c.signal(c.SIGPIPE, previous);
+    clipboard.pump();
+    try t.expect(clipboard.transfers[0] == null);
+}

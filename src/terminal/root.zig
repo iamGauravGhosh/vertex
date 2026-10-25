@@ -21,4 +21,5 @@ test {
     _ = @import("parser_tests.zig");
     _ = @import("screen_tests.zig");
     _ = @import("input_tests.zig");
+    _ = @import("multiplexer_tests.zig");
 }
