@@ -6,8 +6,10 @@ fast, and responsive terminal experience, with particular attention to Hyprland
 and Niri users.
 
 The Linux MVP opens a native Wayland window, starts your interactive shell through
-a PTY, and renders its output with a CPU text renderer. Keyboard input, colors,
-a cursor, window resizing, and integer display scaling are supported.
+a PTY, and renders shaped text using OpenGL ES 3 through EGL, with automatic CPU
+fallback. Glyph atlases and row damage tracking avoid repeated rasterization and
+redrawing unchanged text. Keyboard input, colors, a cursor, window resizing, and
+integer display scaling are supported.
 
 The project also includes a reusable VT parser, a terminal screen model, and a
 command-line event tracer.
@@ -34,14 +36,18 @@ and scrolling regions to a grid of cells. Image decoding remains future work.
 - Zig 0.17.0.
 - Linux with a Wayland compositor for the GUI.
 - `pkg-config`, `wayland-scanner`, `wayland-protocols`, and development libraries
-  for Wayland, xkbcommon, FreeType, Fontconfig, and libc/PTYs.
+  for Wayland/wayland-egl, xkbcommon, FreeType, Fontconfig, HarfBuzz, EGL,
+  OpenGL ES 3, and libc/PTYs.
 - An installed monospace font, resolved through Fontconfig.
 - Python 3 and Weston for executable/window smoke checks in CI.
 
 On Debian/Ubuntu, GUI development dependencies are `libwayland-dev`,
 `wayland-protocols`, `libxkbcommon-dev`, `libfreetype-dev`, `libfontconfig1-dev`,
-and `fonts-dejavu-core`. On Arch Linux, use `wayland`, `wayland-protocols`,
-`libxkbcommon`, `freetype2`, `fontconfig`, and a monospace font.
+`libharfbuzz-dev`, `libegl1-mesa-dev`, `libgles2-mesa-dev`,
+`libwayland-egl-backend-dev`, and `fonts-dejavu-core`. For software GPU tests,
+install `libgl1-mesa-dri`. On Arch Linux, use `wayland`, `wayland-protocols`,
+`libxkbcommon`, `freetype2`, `fontconfig`, `harfbuzz`, `libglvnd`, `mesa`, and a
+monospace font.
 
 The public terminal module and `-Dgui=false` executable remain dependency-free.
 
@@ -68,11 +74,13 @@ Each release includes `vertex-<tag>-linux-x86_64.tar.gz` and its `.sha256` check
 The archive contains `vertex`, `README.md`, and `LICENSE` in a matching directory.
 The executable is built with Zig 0.17.0 in ReleaseSafe mode for a baseline x86_64
 CPU on Ubuntu 24.04. It needs a compatible Linux/glibc system, a Wayland compositor,
-Wayland client libraries, xkbcommon, FreeType, Fontconfig, and a monospace font.
+Wayland client/EGL libraries, xkbcommon, FreeType, Fontconfig, HarfBuzz, EGL,
+OpenGL ES libraries, and a monospace font. EGL/GLES libraries are required even
+when selecting CPU rendering; an available GPU driver is optional in auto mode.
 On Ubuntu 24.04, install the runtime dependencies with:
 
 ```sh
-sudo apt-get install libwayland-client0 libxkbcommon0 libfreetype6 libfontconfig1 fonts-dejavu-core
+sudo apt-get install libwayland-client0 libwayland-egl1 libxkbcommon0 libfreetype6 libfontconfig1 libharfbuzz0b libegl1 libgles2 libgl1-mesa-dri fonts-dejavu-core
 ```
 
 After downloading both release files into the same directory:
@@ -106,6 +114,11 @@ Once built, launch the terminal or run an explicit command:
 zig-out/bin/vertex
 zig-out/bin/vertex -- /bin/sh -c 'printf "Hello\\n"; exec /bin/sh -i'
 ```
+
+Set `VERTEX_RENDERER=auto|gpu|cpu` to choose the backend. The default `auto` tries
+GPU rendering, then permanently switches to CPU for the session if graphics
+initialization or rendering fails. `gpu` reports graphics failures directly;
+`cpu` bypasses EGL initialization. For example: `VERTEX_RENDERER=cpu zig-out/bin/vertex`.
 
 The default shell is `$SHELL`, then the account shell, then `/bin/sh`. Vertex
 inherits the working directory and environment and sets `TERM=xterm-256color`
@@ -143,7 +156,10 @@ currently fixed. Resizing preserves the top-left overlap without reflow and
 notifies the PTY. There are no client-side decorations; use compositor shortcuts
 for moving, resizing, and closing the window.
 
-Each Unicode scalar occupies one cell. Wide characters, grapheme layout, IME,
+HarfBuzz shapes left-to-right runs and enables standard ligatures and contextual
+substitutions when the chosen font supports them. Each Unicode scalar still
+occupies one cell; ligatures retain the source cell span and cursor positions.
+Wide characters, grapheme layout, bidirectional layout, font fallback, color emoji, IME,
 scrollback history, alternate screens, application cursor/keypad modes, terminal
 query replies, selection/clipboard, mouse reporting, images, and fractional-scale
 protocols remain future work. Missing glyphs use a replacement glyph. Blink is
@@ -167,7 +183,10 @@ vertex/
 │   │   ├── parser_tests.zig
 │   │   └── screen_tests.zig
 │   ├── renderer/
-│   │   └── root.zig       # Text and cursor rendering
+│   │   ├── root.zig       # Shared shaping, rasterization, and CPU reference drawing
+│   │   ├── Atlas.zig      # Bounded alpha-mask pages
+│   │   ├── Damage.zig     # Row and cursor presentation damage
+│   │   └── Gpu.zig        # EGL/GLES3 rendering and presentation
 │   └── platform/
 │       ├── root.zig       # Optional Linux GUI entry
 │       ├── linux.zig      # Wayland, keyboard, buffers, and event loop

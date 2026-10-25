@@ -43,6 +43,9 @@ The public API is:
 | `getCell(row, column)` | Return a cell by value, or null outside the grid |
 | `getRow(row)` | Return a borrowed `[]const Cell`, or null outside the grid |
 | `getCursor()` | Return cursor position and visibility by value |
+| `getDamageRows()` | Borrow row flags accumulated since the last acknowledgment |
+| `clearDamage()` | Acknowledge damage after successful presentation |
+| `invalidateAll()` | Mark every row for repaint without changing cells |
 
 Dimensions must be nonzero; overflowing the cell count or byte size returns
 `error.InvalidDimensions`. Allocation failures return `error.OutOfMemory`.
@@ -63,8 +66,25 @@ fill spaces using the active style.
 
 `Color` is a tagged union of `.default`, `.indexed: u8`, and
 `.rgb: { r: u8, g: u8, b: u8 }`. Colors remain symbolic; palette lookup, default
-colors, and visual effects such as inverse/blink belong to a future renderer.
+colors, and visual effects such as inverse/blink belong to the renderer.
 Bold does not implicitly change a color index.
+
+## Presentation damage
+
+Initialization, size-changing resize, reset, and `invalidateAll()` mark all rows.
+Writes, erasure, insertion/deletion, and scrolling mark affected rows. Cursor
+changes, SGR-only changes, and ignored events leave the row flags unchanged;
+a renderer must compare the current cursor with its last presented cursor and
+repaint the old/new visible cursor rows separately.
+
+`getDamageRows()` returns a borrowed `[]const bool` valid until resize/deinit.
+Flags accumulate until `clearDamage()`. One presentation consumer owns that
+acknowledgment and must clear only after successfully presenting the latest
+state, retaining flags while a frame or buffer is unavailable. Multiple rendering
+consumers must coordinate their own acknowledgments. Direct mutation of backing
+cells or other internal fields is unsupported and bypasses damage tracking.
+Event handling and damage operations allocate nothing. A failed resize preserves
+both the cells and pending damage; a same-size resize leaves damage unchanged.
 
 ## Supported controls
 
@@ -146,7 +166,7 @@ outside SGR are ignored as a whole command. No terminal replies are generated.
 ## Limits and validation
 
 The model has no reflow, alternate screen, scrollback, custom tab stops, grapheme
-layout, or images. The Linux application connects it to a Wayland CPU renderer
+layout, or images. The Linux application connects it to Wayland GPU/CPU renderers
 and shell PTY; those dependencies are outside the public terminal module.
 
 `zig test src/main.zig` covers ownership and allocation failure, controls,

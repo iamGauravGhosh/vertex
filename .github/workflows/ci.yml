@@ -11,6 +11,9 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      VERTEX_TEST_GPU: "1"
     outputs:
       release_tag: ${{ steps.version.outputs.tag }}
       prerelease: ${{ steps.version.outputs.prerelease }}
@@ -45,7 +48,7 @@ jobs:
         with:
           version: 0.17.0
       - name: Install Linux GUI and smoke-test dependencies
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev wayland-protocols libxkbcommon-dev libfreetype-dev libfontconfig1-dev fonts-dejavu-core weston
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev wayland-protocols libxkbcommon-dev libfreetype-dev libfontconfig1-dev libharfbuzz-dev libegl1-mesa-dev libgles2-mesa-dev libwayland-egl-backend-dev libgl1-mesa-dri fonts-dejavu-core weston
       - name: Check formatting
         run: zig fmt --check build.zig build.zig.zon src tests
       - name: Test Debug

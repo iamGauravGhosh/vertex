@@ -1,7 +1,7 @@
 # Architecture
 
 Vertex is a terminal emulator written in Zig. The Linux MVP connects a native
-Wayland window, CPU renderer, and interactive shell PTY to the reusable VT parser
+Wayland window, GPU/CPU renderer, and interactive shell PTY to the reusable VT parser
 and resizable screen model. A separate stdin trace CLI remains available.
 
 ## Responsibilities
@@ -12,8 +12,8 @@ and resizable screen model. A separate stdin trace CLI remains available.
   grid with colors, attributes, cursor state, editing, and scrolling regions.
   Resizing preserves the top-left overlap without reflow. Scrollback and alternate
   screens remain future milestones.
-- `src/renderer/`: Fontconfig font selection, bounded FreeType glyph cache, and
-  cell/style/cursor drawing into XRGB8888 memory.
+- `src/renderer/`: Fontconfig font selection, HarfBuzz shaping, bounded FreeType
+  atlas pages, row/cursor damage, GLES3 rendering, and a CPU reference backend.
 - `src/platform/`: native Wayland globals, xdg-shell, shared-memory buffers,
   xkbcommon keyboard state, timer-based repeat, PTY, and child lifecycle.
 - `assets/fonts/`: reserved for future bundled fonts; the MVP uses system fonts.
@@ -37,6 +37,22 @@ modes, perform screen updates, write responses, or access the clipboard.
 and scrolling commands. The screen allocates at initialization and resize and
 processes events without allocation. See [the parser guide](vt-parser.md) for syntax and
 [the screen guide](screen.md) for command execution and ownership.
+
+## Text layout and atlas ownership
+
+Each row caches shaped glyph IDs, positions, source cell spans, and style/script
+runs. HarfBuzz uses left-to-right direction and monotone character clusters.
+Clusters are anchored to terminal columns and clipped to their source span;
+this does not change scalar-per-cell storage or introduce bidi/grapheme layout.
+Cursor colors clip the same shaped geometry to each cell without breaking a
+ligature. Scale changes refresh the HarfBuzz font and invalidate shaped rows.
+
+FreeType rasterizes glyph IDs into four lazily allocated 1024×1024 grayscale
+pages. Shelf packing leaves padding, least-recently-used pages are recycled,
+and oversized bitmaps are tiled using bounded scratch storage. CPU and GPU
+share these masks; GLES uses R8 textures and uploads inserted regions. Pending
+GPU batches are submitted before atlas reuse. Cached shaping never stores atlas
+coordinates, and page revisions synchronize masks populated by either backend.
 
 ## Image extension boundary
 
@@ -67,10 +83,29 @@ in the build cache. Only generated protocol code is C; application logic is Zig.
 One loop dispatches Wayland events, reads bounded PTY batches, flushes queued
 keyboard bytes, and handles keyboard-repeat timers. It follows Wayland's
 prepare/read/cancel contract and enables writable polling when a flush would
-block. Frames are scheduled only when terminal state or window size changes.
-Two active shared-memory buffers are used; resize retires old buffers until
-the compositor releases them. Output enter/leave and scale events determine the
-integer buffer scale, independently of logical terminal dimensions.
+block. Frames are scheduled only for damaged rows, visible cursor changes, or
+window changes, and remain throttled by Wayland frame callbacks. Output enter/leave
+and scale events determine the integer buffer scale independently of logical
+terminal dimensions.
+
+`VERTEX_RENDERER` selects `auto` (default), `gpu`, or `cpu`. The EGL backend owns
+a GLES3 context, Wayland EGL window, and persistent framebuffer texture. Only
+damaged rows are repainted; the entire retained texture is blitted to each EGL
+backbuffer so correctness does not depend on buffer age or preservation. KHR/EXT
+swap-with-damage is used when available, with bottom-left pixel rectangles;
+otherwise presentation uses ordinary swaps. A context or presentation failure
+in auto mode switches permanently to CPU after destroying EGL resources.
+
+The CPU backend keeps a canonical XRGB8888 image and two shared-memory buffers.
+Each buffer accumulates its own pending rows, including while busy, and catches
+up from the canonical image only after release. Resize retires incompatible
+buffers until the compositor releases them. Initialization, resize, scale, and
+backend changes repaint the whole surface, including unused padding.
+
+The screen exposes borrowed row damage with explicit acknowledgment. Damage is
+cleared only after presentation succeeds, so deferred frames retain every edit.
+Cursor rows are tracked separately against the last presented cursor; SGR-only
+changes and ignored protocol strings do not schedule frames.
 
 The PTY child receives a new session and controlling terminal, reset signal
 dispositions, inherited working directory, and terminal environment variables.
@@ -80,7 +115,13 @@ the window hangs up the foreground job and shell session, with bounded waiting
 and forced termination of an unresponsive shell.
 
 Headless tests cover parsing, screen resizing, key encoding, PTY I/O and lifecycle,
-and in-memory rendering. CI also starts private headless Weston instances at
-different geometries/scales. The optional `VERTEX_TEST_WAYLAND=1` integration
+and in-memory rendering. Surfaceless Mesa tests compare incremental GPU and CPU
+pixels with full redraws, with at most one channel value of blending tolerance.
+CI requires these GPU tests using `VERTEX_TEST_GPU=1` and
+`LIBGL_ALWAYS_SOFTWARE=1`; without the requirement variable, unavailable headless
+EGL causes the GPU comparison test to skip. CI also starts private headless Weston
+instances at different geometries/scales, forces both backends, injects an EGL
+initialization failure to verify auto fallback, and checks partial damage and
+idle frame suppression. The optional `VERTEX_TEST_WAYLAND=1` integration
 test opens a real window, renders a short command, and checks its exit status.
 Full-screen applications, scrollback, grapheme layout, and images remain future work.

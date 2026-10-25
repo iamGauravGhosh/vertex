@@ -139,3 +139,18 @@ test "a consumer rejects incomplete cancelled and over-budget image transfers" {
     try std.testing.expect(transfer.accepted);
     try std.testing.expectEqualStrings("Gok", transfer.bytes[0..transfer.used]);
 }
+
+test "a presentation consumer can inspect accumulate and acknowledge row damage" {
+    var screen = try vt.Screen.init(std.testing.allocator, 2, 4);
+    defer screen.deinit();
+    try std.testing.expectEqualSlices(bool, &.{ true, true }, screen.getDamageRows());
+    screen.clearDamage();
+    var parser = vt.Parser.init();
+    parser.feed("X", &screen);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, screen.getDamageRows());
+    parser.feed("\r\nY", &screen);
+    try std.testing.expectEqualSlices(bool, &.{ true, true }, screen.getDamageRows());
+    screen.clearDamage();
+    screen.invalidateAll();
+    try std.testing.expectEqualSlices(bool, &.{ true, true }, screen.getDamageRows());
+}

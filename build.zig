@@ -42,6 +42,10 @@ pub fn build(b: *std.Build) void {
         bindings.linkSystemLibrary("fontconfig", .{});
         bindings.linkSystemLibrary("wayland-client", .{});
         bindings.linkSystemLibrary("xkbcommon", .{});
+        bindings.linkSystemLibrary("harfbuzz", .{});
+        bindings.linkSystemLibrary("egl", .{});
+        bindings.linkSystemLibrary("glesv2", .{});
+        bindings.linkSystemLibrary("wayland-egl", .{});
         const c_module = bindings.createModule();
         configureLinux(exe.root_module, c_module, code);
         const integration = b.addTest(.{ .root_module = b.createModule(.{
@@ -84,7 +88,7 @@ pub fn build(b: *std.Build) void {
 fn configureLinux(module: *std.Build.Module, bindings: *std.Build.Module, protocol: std.Build.LazyPath) void {
     module.addImport("c", bindings);
     module.link_libc = true;
-    for ([_][]const u8{ "wayland-client", "xkbcommon", "freetype2", "fontconfig", "util" }) |library| {
+    for ([_][]const u8{ "wayland-client", "xkbcommon", "freetype2", "fontconfig", "harfbuzz", "EGL", "GLESv2", "wayland-egl", "util" }) |library| {
         module.linkSystemLibrary(library, .{});
     }
     module.addCSourceFile(.{ .file = protocol });

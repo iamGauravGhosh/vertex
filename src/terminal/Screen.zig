@@ -48,6 +48,7 @@ allocator: std.mem.Allocator,
 rows: usize,
 columns: usize,
 cells: []Cell,
+damage_rows: []bool,
 cursor: Cursor = .{},
 style: Style = .{},
 scroll_top: usize = 0,
@@ -62,18 +63,23 @@ pub fn init(allocator: std.mem.Allocator, rows: usize, columns: usize) !Screen {
     const count = std.math.mul(usize, rows, columns) catch return error.InvalidDimensions;
     _ = std.math.mul(usize, count, @sizeOf(Cell)) catch return error.InvalidDimensions;
     const cells = try allocator.alloc(Cell, count);
+    errdefer allocator.free(cells);
+    const damage_rows = try allocator.alloc(bool, rows);
+    @memset(damage_rows, true);
     @memset(cells, .{});
     return .{
         .allocator = allocator,
         .rows = rows,
         .columns = columns,
         .cells = cells,
+        .damage_rows = damage_rows,
         .scroll_bottom = rows,
     };
 }
 
 pub fn deinit(self: *Screen) void {
     self.allocator.free(self.cells);
+    self.allocator.free(self.damage_rows);
     self.* = undefined;
 }
 
@@ -88,7 +94,9 @@ pub fn resize(self: *Screen, rows: usize, columns: usize) !void {
         @memcpy(replacement.cells[row * columns ..][0..width], self.cells[row * self.columns ..][0..width]);
     }
     self.allocator.free(self.cells);
+    self.allocator.free(self.damage_rows);
     self.cells = replacement.cells;
+    self.damage_rows = replacement.damage_rows;
     self.rows = rows;
     self.columns = columns;
     self.cursor.row = @min(self.cursor.row, rows - 1);
@@ -104,6 +112,7 @@ pub fn resize(self: *Screen, rows: usize, columns: usize) !void {
 /// Reset screen state only. Reset the separate Parser as well to abandon input.
 pub fn reset(self: *Screen) void {
     @memset(self.cells, .{});
+    self.invalidateAll();
     self.cursor = .{};
     self.style = .{};
     self.scroll_top = 0;
@@ -128,6 +137,21 @@ pub fn getRow(self: *const Screen, row: usize) ?[]const Cell {
 
 pub fn getCursor(self: *const Screen) Cursor {
     return self.cursor;
+}
+
+/// Borrowed row damage since the last clear; cursor damage is tracked by the renderer.
+/// Valid until resize/deinit. A single presentation consumer owns clearing damage.
+pub fn getDamageRows(self: *const Screen) []const bool {
+    return self.damage_rows;
+}
+
+/// Acknowledge only after a successful presentation, never while a frame is deferred.
+pub fn clearDamage(self: *Screen) void {
+    @memset(self.damage_rows, false);
+}
+
+pub fn invalidateAll(self: *Screen) void {
+    @memset(self.damage_rows, true);
 }
 
 /// Synchronously consume an event, including its borrowed parameter slices.
@@ -164,6 +188,7 @@ fn print(self: *Screen, codepoint: u21) void {
         .codepoint = codepoint,
         .style = self.style,
     };
+    self.damage_rows[self.cursor.row] = true;
     if (self.cursor.column == self.columns - 1) {
         self.wrap_pending = self.autowrap;
     } else {
@@ -358,6 +383,7 @@ fn moveDown(self: *Screen, count: usize) void {
 
 fn blank(self: *Screen, start: usize, end: usize) void {
     @memset(self.cells[start..end], .{ .style = self.style });
+    if (start < end) @memset(self.damage_rows[start / self.columns .. (end - 1) / self.columns + 1], true);
 }
 
 fn eraseDisplay(self: *Screen, mode: u16) void {
@@ -406,6 +432,7 @@ fn scrollUp(self: *Screen, top: usize, bottom: usize, count: usize) void {
     const end = bottom * self.columns;
     const distance = @min(count, bottom - top) * self.columns;
     std.mem.copyForwards(Cell, self.cells[start .. end - distance], self.cells[start + distance .. end]);
+    @memset(self.damage_rows[top..bottom], true);
     self.blank(end - distance, end);
 }
 
@@ -414,6 +441,7 @@ fn scrollDown(self: *Screen, top: usize, bottom: usize, count: usize) void {
     const end = bottom * self.columns;
     const distance = @min(count, bottom - top) * self.columns;
     std.mem.copyBackwards(Cell, self.cells[start + distance .. end], self.cells[start .. end - distance]);
+    @memset(self.damage_rows[top..bottom], true);
     self.blank(start, start + distance);
 }
 

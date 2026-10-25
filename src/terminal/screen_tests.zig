@@ -50,7 +50,7 @@ test "resize preserves overlap and styles, blanks growth, and clamps saved state
 }
 
 test "resize validates dimensions and allocation failure preserves the original screen" {
-    var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 1 });
+    var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 2 });
     var screen = try vt.Screen.init(failing.allocator(), 2, 3);
     defer screen.deinit();
     feed(&screen, "abc\r\ndef");
@@ -84,13 +84,13 @@ test "screen owns a blank fixed grid and checks dimensions and access bounds" {
 test "allocation failure is clean and events do not allocate" {
     var allocator = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
     try t.expectError(error.OutOfMemory, vt.Screen.init(allocator.allocator(), 2, 4));
-    allocator = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 1 });
+    allocator = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 2 });
     {
         var screen = try vt.Screen.init(allocator.allocator(), 2, 4);
         defer screen.deinit();
         feed(&screen, "\x1b[38;2;1;2;3mhello\r\nworld\x1b[2S\x1b[2T\x1b[2J\x1b[c");
         screen.reset();
-        try t.expectEqual(@as(usize, 1), allocator.alloc_index);
+        try t.expectEqual(@as(usize, 2), allocator.alloc_index);
         try t.expect(!allocator.has_induced_failure);
     }
     try t.expectEqual(allocator.allocated_bytes, allocator.freed_bytes);
@@ -457,4 +457,59 @@ test "arbitrary byte streams keep cursor and scroll bounds valid" {
         try t.expect(screen.scroll_bottom <= screen.rows);
     }
     finish(&parser, &screen);
+}
+
+test "screen damage covers writes erases edits scrolls and reset but not presentation-neutral events" {
+    var screen = try vt.Screen.init(t.allocator, 4, 5);
+    defer screen.deinit();
+    for (screen.getDamageRows()) |changed| try t.expect(changed);
+    screen.clearDamage();
+    feed(&screen, "\x1b[31m\x1b[2;3H\x1b[?25l\x1b]0;title\x07");
+    for (screen.getDamageRows()) |changed| try t.expect(!changed);
+    feed(&screen, "A");
+    try t.expectEqualSlices(bool, &.{ false, true, false, false }, screen.getDamageRows());
+    const edits = [_][]const u8{ "\x1b[K", "\x1b[X", "\x1b[@", "\x1b[P", "\x1b[1K", "\x1b[2K" };
+    for (edits) |edit| {
+        screen.clearDamage();
+        feed(&screen, edit);
+        try t.expectEqualSlices(bool, &.{ false, true, false, false }, screen.getDamageRows());
+    }
+    feed(&screen, "\x1b[2;3r");
+    for ([_][]const u8{ "\x1b[S", "\x1b[T", "\x1b[2;1H\x1b[L", "\x1b[2;1H\x1b[M", "\x1b[3;1H\n", "\x1b[2;1H\x1bM" }) |scroll| {
+        screen.clearDamage();
+        feed(&screen, scroll);
+        try t.expectEqualSlices(bool, &.{ false, true, true, false }, screen.getDamageRows());
+    }
+    screen.clearDamage();
+    feed(&screen, "\x1b[3;1H\x1b[J");
+    try t.expectEqualSlices(bool, &.{ false, false, true, true }, screen.getDamageRows());
+    screen.clearDamage();
+    feed(&screen, "\x1b[2;1H\x1b[1J");
+    try t.expectEqualSlices(bool, &.{ true, true, false, false }, screen.getDamageRows());
+    screen.clearDamage();
+    screen.reset();
+    for (screen.getDamageRows()) |changed| try t.expect(changed);
+    screen.clearDamage();
+    try screen.resize(5, 6);
+    for (screen.getDamageRows()) |changed| try t.expect(changed);
+}
+
+test "every screen allocation failure frees storage and resize retains pending damage" {
+    for (0..2) |fail| {
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = fail });
+        try t.expectError(error.OutOfMemory, vt.Screen.init(failing.allocator(), 2, 3));
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    for (2..4) |fail| {
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = fail });
+        var screen = try vt.Screen.init(failing.allocator(), 2, 3);
+        defer screen.deinit();
+        screen.clearDamage();
+        feed(&screen, "X");
+        const old = screen.getDamageRows().ptr;
+        try t.expectError(error.OutOfMemory, screen.resize(3, 4));
+        try t.expectEqual(old, screen.getDamageRows().ptr);
+        try t.expectEqualSlices(bool, &.{ true, false }, screen.getDamageRows());
+        try t.expectEqual(@as(u21, 'X'), screen.getCell(0, 0).?.codepoint);
+    }
 }

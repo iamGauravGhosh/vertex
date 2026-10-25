@@ -3,6 +3,7 @@ const std = @import("std");
 const c = @import("c");
 const vt = @import("../terminal/root.zig");
 const Renderer = @import("../renderer/root.zig");
+const Gpu = @import("../renderer/Gpu.zig");
 const Pty = @import("Pty.zig");
 const input = @import("input.zig");
 const common = @import("common.zig");
@@ -15,13 +16,41 @@ const Buffer = struct {
     height: usize,
     busy: bool = false,
     retired: bool = false,
+    pending_rows: []bool,
+    full_pending: bool = true,
+
+    fn track(self: *Buffer, damage: *const Renderer.Damage) void {
+        if (damage.full) self.full_pending = true;
+        for (damage.rows, self.pending_rows) |changed, *pending| pending.* = pending.* or changed;
+    }
+
+    fn sync(self: *Buffer, pixels: []const u32, cell_height: usize) void {
+        std.debug.assert(!self.busy);
+        if (self.full_pending) {
+            @memcpy(self.pixels, pixels);
+        } else for (self.pending_rows, 0..) |changed, row| {
+            if (!changed) continue;
+            const start = @min(self.height, row * cell_height) * self.width;
+            const end = @min(self.height, (row + 1) * cell_height) * self.width;
+            @memcpy(self.pixels[start..end], pixels[start..end]);
+        }
+        self.full_pending = false;
+        @memset(self.pending_rows, false);
+    }
 };
 
 pub fn run(allocator: std.mem.Allocator, command: []const []const u8) !u8 {
+    const mode_name = c.getenv("VERTEX_RENDERER");
+    const mode = Gpu.Mode.parse(if (mode_name != null) std.mem.span(mode_name) else null) catch {
+        std.debug.print("vertex: VERTEX_RENDERER must be auto, gpu, or cpu\n", .{});
+        return error.InvalidRenderer;
+    };
     var app: App = .{
         .allocator = allocator,
         .renderer = try Renderer.init(allocator),
         .screen = undefined,
+        .mode = mode,
+        .damage = Renderer.Damage.init(allocator),
     };
     defer app.deinit();
     app.screen = try vt.Screen.init(allocator, 24, 80);
@@ -37,6 +66,11 @@ const App = struct {
     renderer: Renderer,
     screen: vt.Screen,
     screen_ready: bool = false,
+    mode: Gpu.Mode = .auto,
+    gpu: ?Gpu = null,
+    backend_started: bool = false,
+    damage: ?Renderer.Damage = null,
+    pixels: []u32 = &.{},
     parser: vt.Parser = vt.Parser.init(),
     pty: ?Pty = null,
     pty_eof: bool = false,
@@ -74,7 +108,6 @@ const App = struct {
     scale: usize = 1,
     configured: bool = false,
     size_changed: bool = true,
-    dirty: bool = true,
     closing: bool = false,
     failure: ?anyerror = null,
 
@@ -175,10 +208,11 @@ const App = struct {
         try self.renderer.setScale(self.scale);
         c.wl_surface_set_buffer_scale(self.surface, @intCast(self.scale));
         for (self.buffers.items) |buffer| {
-            if (buffer.width != self.width * self.scale or buffer.height != self.height * self.scale) buffer.retired = true;
+            if (buffer.width != self.width * self.scale or buffer.height != self.height * self.scale or buffer.pending_rows.len != self.screen.rows) buffer.retired = true;
         }
+        if (self.gpu) |*gpu| gpu.resize(self.width * self.scale, self.height * self.scale) catch |err| try self.disableGpu(err);
         self.size_changed = false;
-        self.dirty = true;
+        self.damage.?.invalidate();
     }
 
     fn drainPty(self: *App) !void {
@@ -195,7 +229,6 @@ const App = struct {
                 return;
             }
             self.parser.feed(bytes[0..count], &self.screen);
-            self.dirty = true;
             budget -= count;
         }
     }
@@ -216,9 +249,51 @@ const App = struct {
         }
     }
 
+    fn disableGpu(self: *App, failure: anyerror) !void {
+        if (failure == error.OutOfMemory or self.mode == .gpu) return failure;
+        std.debug.print("vertex: GPU rendering unavailable ({s}); using CPU renderer\n", .{@errorName(failure)});
+        if (self.frame) |callback| c.wl_callback_destroy(callback);
+        self.frame = null;
+        if (self.gpu) |*gpu| gpu.deinit();
+        self.gpu = null;
+        self.damage.?.invalidate();
+    }
+
+    fn requestFrame(self: *App) !void {
+        self.frame = c.wl_surface_frame(self.surface) orelse return error.WaylandObjectFailed;
+        if (c.wl_callback_add_listener(self.frame, &frame_listener, self) != 0) return error.WaylandListenerFailed;
+    }
+
     fn draw(self: *App) !void {
         self.collectBuffers();
-        if (!self.dirty or self.frame != null) return;
+        if (self.frame != null) return;
+        const width = self.width * self.scale;
+        const height = self.height * self.scale;
+        const damage = &self.damage.?;
+        if (!try damage.prepare(&self.screen, width, height, self.renderer.cell_height * self.scale)) return;
+        if (!self.backend_started) {
+            self.backend_started = true;
+            if (self.mode != .cpu) {
+                self.gpu = Gpu.init(self.allocator, self.display.?, self.surface.?, width, height) catch |err| blk: {
+                    try self.disableGpu(err);
+                    break :blk null;
+                };
+                if (self.gpu) |*gpu| gpu.syncAtlas(&self.renderer.atlas) catch |err| try self.disableGpu(err);
+            }
+        }
+        if (self.gpu) |*gpu| {
+            gpu.render(&self.renderer, &self.screen, damage) catch |err| {
+                try self.disableGpu(err);
+                return self.draw();
+            };
+            try self.requestFrame();
+            gpu.present(damage.rects.items) catch |err| {
+                try self.disableGpu(err);
+                return self.draw();
+            };
+            damage.commit(&self.screen);
+            return;
+        }
         var available: ?*Buffer = null;
         var active: usize = 0;
         for (self.buffers.items) |buffer| {
@@ -229,14 +304,26 @@ const App = struct {
         }
         if (available == null and active < 2) available = try self.createBuffer();
         const buffer = available orelse return;
-        try self.renderer.draw(&self.screen, buffer.pixels, buffer.width, buffer.height);
-        self.frame = c.wl_surface_frame(self.surface) orelse return error.WaylandObjectFailed;
-        _ = c.wl_callback_add_listener(self.frame, &frame_listener, self);
+        if (self.pixels.len != width * height) {
+            const replacement = try self.allocator.alloc(u32, width * height);
+            self.allocator.free(self.pixels);
+            self.pixels = replacement;
+            damage.invalidate();
+            _ = try damage.prepare(&self.screen, width, height, self.renderer.cell_height * self.scale);
+        }
+        if (damage.full) @memset(self.pixels, Renderer.default_background);
+        try self.renderer.drawRows(&self.screen, self.pixels, width, height, damage.rows);
+        for (self.buffers.items) |item| {
+            if (item.retired) continue;
+            item.track(damage);
+        }
+        buffer.sync(self.pixels, self.renderer.cell_height * self.scale);
+        try self.requestFrame();
         c.wl_surface_attach(self.surface, buffer.object, 0, 0);
-        c.wl_surface_damage_buffer(self.surface, 0, 0, @intCast(buffer.width), @intCast(buffer.height));
+        for (damage.rects.items) |rect| c.wl_surface_damage_buffer(self.surface, rect.x, rect.y, rect.width, rect.height);
         c.wl_surface_commit(self.surface);
         buffer.busy = true;
-        self.dirty = false;
+        damage.commit(&self.screen);
     }
 
     fn createBuffer(self: *App) !*Buffer {
@@ -256,7 +343,10 @@ const App = struct {
         errdefer c.wl_buffer_destroy(object);
         const buffer = try self.allocator.create(Buffer);
         errdefer self.allocator.destroy(buffer);
-        buffer.* = .{ .object = object, .pixels = @as([*]u32, @ptrCast(@alignCast(memory.?)))[0 .. width * height], .width = width, .height = height };
+        const pending_rows = try self.allocator.alloc(bool, self.screen.rows);
+        errdefer self.allocator.free(pending_rows);
+        @memset(pending_rows, true);
+        buffer.* = .{ .object = object, .pixels = @as([*]u32, @ptrCast(@alignCast(memory.?)))[0 .. width * height], .width = width, .height = height, .pending_rows = pending_rows };
         _ = c.wl_buffer_add_listener(object, &buffer_listener, buffer);
         try self.buffers.append(self.allocator, buffer);
         return buffer;
@@ -346,6 +436,7 @@ const App = struct {
         if (self.seat) |object| {
             if (c.wl_seat_get_version(object) >= 5) c.wl_seat_release(object) else c.wl_seat_destroy(object);
         }
+        if (self.gpu) |*gpu| gpu.deinit();
         if (self.toplevel) |object| c.xdg_toplevel_destroy(object);
         if (self.xdg_surface) |object| c.xdg_surface_destroy(object);
         if (self.surface) |object| c.wl_surface_destroy(object);
@@ -372,12 +463,15 @@ const App = struct {
         self.pending.deinit(self.allocator);
         if (self.screen_ready) self.screen.deinit();
         self.renderer.deinit();
+        if (self.damage) |*damage| damage.deinit();
+        self.allocator.free(self.pixels);
     }
 };
 
 fn destroyBuffer(allocator: std.mem.Allocator, buffer: *Buffer) void {
     c.wl_buffer_destroy(buffer.object);
     _ = c.munmap(buffer.pixels.ptr, buffer.pixels.len * 4);
+    allocator.free(buffer.pending_rows);
     allocator.destroy(buffer);
 }
 
@@ -635,4 +729,63 @@ test "keyboard focus loss disarms repeat in the kernel and clears composed input
     try std.testing.expect(!app.focused and app.repeat_key == null and app.composed_length == 0);
     try std.testing.expectEqual(@as(c_long, 0), remaining.it_value.tv_sec);
     try std.testing.expectEqual(@as(c_long, 0), remaining.it_value.tv_nsec);
+}
+
+test "alternating CPU buffers catch up every pending row without writing busy memory" {
+    const t = std.testing;
+    var canonical = [_]u32{ 1, 1, 2, 2, 3, 3, 4, 4, 99, 99 };
+    var first_pixels: [10]u32 = undefined;
+    var second_pixels: [10]u32 = undefined;
+    var first_rows = [_]bool{ true, true, true, true };
+    var second_rows = first_rows;
+    var first: Buffer = .{ .object = undefined, .pixels = &first_pixels, .width = 2, .height = 5, .pending_rows = &first_rows };
+    var second: Buffer = .{ .object = undefined, .pixels = &second_pixels, .width = 2, .height = 5, .pending_rows = &second_rows };
+    first.sync(&canonical, 1);
+    second.sync(&canonical, 1);
+    first.busy = true;
+    second.busy = true;
+    var damage = Renderer.Damage.init(t.allocator);
+    defer damage.deinit();
+    damage.rows = try t.allocator.dupe(bool, &.{ true, false, false, false });
+    damage.full = false;
+    canonical[0] = 10;
+    first.track(&damage);
+    second.track(&damage);
+    try t.expectEqual(@as(u32, 1), first.pixels[0]);
+    first.busy = false;
+    first.sync(&canonical, 1);
+    canonical[4] = 30;
+    @memcpy(damage.rows, &[_]bool{ false, false, true, false });
+    first.track(&damage);
+    second.track(&damage);
+    try t.expectEqual(@as(u32, 1), second.pixels[0]);
+    second.busy = false;
+    second.sync(&canonical, 1);
+    try t.expectEqualSlices(u32, &canonical, second.pixels);
+    first.sync(&canonical, 1);
+    try t.expectEqualSlices(u32, &canonical, first.pixels);
+    // A full repaint must also repair pixels below the terminal grid.
+    canonical[9] = 100;
+    damage.full = true;
+    first.track(&damage);
+    first.sync(&canonical, 1);
+    try t.expectEqual(@as(u32, 100), first.pixels[9]);
+}
+
+test "auto GPU failure preserves damage and forced GPU failures propagate" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .renderer = undefined,
+        .screen = undefined,
+        .damage = Renderer.Damage.init(std.testing.allocator),
+    };
+    defer app.damage.?.deinit();
+    app.damage.?.invalid = false;
+    try app.disableGpu(error.EglContextLost);
+    try std.testing.expect(app.gpu == null);
+    try std.testing.expect(app.damage.?.invalid);
+    app.mode = .gpu;
+    try std.testing.expectError(error.EglContextLost, app.disableGpu(error.EglContextLost));
+    app.mode = .auto;
+    try std.testing.expectError(error.OutOfMemory, app.disableGpu(error.OutOfMemory));
 }

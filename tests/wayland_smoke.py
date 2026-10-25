@@ -24,12 +24,14 @@ def wait_for(predicate, message, seconds=10):
     raise AssertionError(message)
 
 
-def check_window(width, height, scale):
+def check_window(width, height, scale, renderer="gpu", fail_gpu=False):
     with tempfile.TemporaryDirectory(prefix="vertex-wayland-") as temporary:
         root = Path(temporary)
         environment = os.environ.copy()
         environment.pop("WAYLAND_SOCKET", None)
         environment.update(XDG_RUNTIME_DIR=temporary, WAYLAND_DISPLAY="vertex-test")
+        environment.pop("__EGL_VENDOR_LIBRARY_FILENAMES", None)
+        environment.update(VERTEX_RENDERER=renderer, LIBGL_ALWAYS_SOFTWARE="1")
         with (root / "weston.log").open("w+") as compositor_log:
             weston = subprocess.Popen(
                 ["weston", "--backend=headless-backend.so", "--renderer=pixman",
@@ -43,21 +45,36 @@ def check_window(width, height, scale):
                 if weston.poll() is not None:
                     raise AssertionError((root / "weston.log").read_text())
                 environment["WAYLAND_DEBUG"] = "client"
+                if fail_gpu:
+                    environment["__EGL_VENDOR_LIBRARY_FILENAMES"] = str(root / "missing-egl-vendor.json")
                 report = root / "size"
                 result = subprocess.run(
                     [str(EXECUTABLE), "--", "/bin/sh", "-c",
                      "test -t 0 && test -t 1 && test -t 2 || exit 90; "
                      "stty size > \"$1\"; "
-                     "printf '\\033[31mVertex shell output\\033[0m\\n'; sleep 0.3; exit 7",
+                     "printf '\\033[31mVertex shell output\\033[0m\\n'; sleep 0.3; "
+                     "printf '\\033[1;1HX'; sleep 0.3; "
+                     "printf '\\033[32m\\033]0;ignored\\007'; sleep 0.5; exit 7",
                      "vertex-test", str(report)],
                     env=environment, capture_output=True, timeout=15, check=False,
                 )
                 trace = result.stderr.decode(errors="replace")
                 assert result.returncode == 7, trace
                 assert re.search(r"wl_surface.*\.attach\(", trace), trace
+                if fail_gpu:
+                    assert "using CPU renderer" in trace, trace
+                elif renderer == "gpu":
+                    assert "using CPU renderer" not in trace, trace
+                damage = re.findall(r"wl_surface.*\.damage_buffer\((-?\d+), (-?\d+), (\d+), (\d+)\)", trace)
+                assert damage, trace
+                assert any(int(h) < height for _, _, _, h in damage), trace
+                # No frames should be committed for the final SGR/OSC-only update
+                # or while the child is idle. Allow initial configure/scale frames.
+                commits = re.findall(r"wl_surface.*\.commit\(\)", trace)
+                assert len(commits) <= 6, trace
                 rows, columns = map(int, report.read_text().split())
                 assert rows > 0 and columns > 0
-                print(f"Wayland {width}x{height} scale {scale}: {columns}x{rows} cells, frame committed, child reaped")
+                print(f"Wayland {renderer} {width}x{height} scale {scale}: {columns}x{rows} cells, frame committed, child reaped")
                 # A disconnected compositor must also hang up and reap a shell
                 # that is still running, rather than leave a background session.
                 pid_file = root / "child-pid"
@@ -98,3 +115,6 @@ large = check_window(800, 600, 1)
 small = check_window(640, 480, 1)
 assert small[0] < large[0] and small[1] < large[1], (large, small)
 check_window(1280, 960, 2)
+
+check_window(800, 600, 1, renderer="cpu")
+check_window(800, 600, 1, renderer="auto", fail_gpu=True)
