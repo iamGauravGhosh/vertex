@@ -4,7 +4,7 @@ const Atlas = @This();
 pub const size = 1024;
 pub const tile_size = size - 2;
 pub const page_count = 4;
-pub const Key = struct { glyph: u64, x: u32 = 0, y: u32 = 0 };
+pub const Key = struct { glyph: u64, width: u32 = 0, height: u32 = 0, x: u32 = 0, y: u32 = 0 };
 pub const Region = struct { page: usize, x: usize, y: usize, width: usize, height: usize, color: bool = false };
 pub const Page = struct {
     pixels: []u8 = &.{},

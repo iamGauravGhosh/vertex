@@ -312,7 +312,9 @@ test "shaping forms ligatures, preserves columns and style boundaries, and cache
     try t.expectEqual(@as(usize, 0), glyphs[0].column);
     try t.expectEqual(@as(usize, 3), glyphs[0].end);
     const last = glyphs[glyphs.len - 1];
-    try t.expectEqual(@as(i64, @intCast(3 * renderer.cell_width * 64)), last.x);
+    try t.expectEqual(@as(usize, 3), last.column);
+    try t.expect(last.x >= 3 * renderer.cell_width * 64);
+    try t.expect(last.x + @as(i64, @intCast(last.width * 64)) <= 4 * renderer.cell_width * 64);
     const shaped = renderer.shaped_rows;
     parser.feed("\x1b[1G\x1b[?25l", &screen);
     _ = try renderer.shapeRow(&screen, 0);
@@ -323,6 +325,201 @@ test "shaping forms ligatures, preserves columns and style boundaries, and cache
     try renderer.setScale(2);
     _ = try renderer.shapeRow(&screen, 0);
     try t.expectEqual(shaped + 2, renderer.shaped_rows);
+}
+
+test "configured fonts default safely and accept proportional patterns and symbol-only faces" {
+    var default = try Renderer.initConfigured(t.allocator, null);
+    defer default.deinit();
+    var empty = try Renderer.initConfigured(t.allocator, "");
+    defer empty.deinit();
+    try t.expectEqual(default.cell_width, empty.cell_width);
+    try t.expectEqual(default.cell_height, empty.cell_height);
+    var proportional = try Renderer.initConfigured(t.allocator, "sans:spacing=0");
+    defer proportional.deinit();
+    try t.expect(proportional.face.*.face_flags & c.FT_FACE_FLAG_FIXED_WIDTH == 0);
+    var missing = try Renderer.initConfigured(t.allocator, "Vertex Deliberately Unavailable Font");
+    defer missing.deinit();
+    try t.expect(missing.cell_width > 0 and missing.cell_height > 0);
+    var symbols = try Renderer.initFontDirectory(t.allocator, "Vertex Test Icons", "tests/fonts");
+    defer symbols.deinit();
+    try t.expectEqual(@as(c_uint, 0), c.FT_Get_Char_Index(symbols.face, 'M'));
+    try t.expect(symbols.cell_width > 0 and symbols.cell_height > 0);
+}
+
+test "optional installed font renders text and Nerd symbols on the terminal grid" {
+    const name = c.getenv("VERTEX_TEST_FONT");
+    if (name == null) return error.SkipZigTest;
+    var renderer = try Renderer.initConfigured(t.allocator, std.mem.span(name));
+    defer renderer.deinit();
+    var screen = try vt.Screen.init(t.allocator, 2, 12);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("iW\u{e0b0}\u{f0001}\u{f013}ii A\u{301}\r\nאבA😀\x1b[?25l", &screen);
+    for ([_]usize{ 1, 2 }) |scale| {
+        try renderer.setScale(scale);
+        const width = screen.columns * renderer.cell_width * scale;
+        const height = screen.rows * renderer.cell_height * scale;
+        const pixels = try t.allocator.alloc(u32, width * height);
+        defer t.allocator.free(pixels);
+        try renderer.draw(&screen, pixels, width, height);
+        for (0..screen.rows) |row| for (try renderer.shapeRow(&screen, row)) |g| {
+            try expectGlyphColumns(&renderer, &screen, row, g);
+        };
+    }
+}
+
+fn expectGlyphColumns(renderer: *Renderer, screen: *const vt.Screen, row: usize, glyph: Renderer.PositionedGlyph) !void {
+    if (glyph.width == 0 or glyph.height == 0) return;
+    var visual = screen.columns;
+    for (glyph.column..glyph.end) |column| visual = @min(visual, try renderer.visualColumn(screen, row, column));
+    const left: i64 = @intCast(visual * renderer.cell_width * renderer.scale);
+    const right: i64 = left + @as(i64, @intCast((glyph.end - glyph.column) * renderer.cell_width * renderer.scale));
+    try t.expect(@divFloor(glyph.x, 64) >= left);
+    try t.expect(@divFloor(glyph.x, 64) + @as(i64, @intCast(glyph.width)) <= right);
+}
+
+test "proportional glyphs fit cells while ligatures combining marks and wide cells retain their spans" {
+    var renderer = try Renderer.initFontDirectory(t.allocator, "Vertex Test Proportional", "tests/fonts");
+    defer renderer.deinit();
+    var screen = try vt.Screen.init(t.allocator, 1, 10);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("iWOA\u{301}ii界A\u{e0b0}\x1b[?25l", &screen);
+    for ([_]usize{ 1, 2 }) |scale| {
+        try renderer.setScale(scale);
+        const glyphs = try renderer.shapeRow(&screen, 0);
+        var marks: usize = 0;
+        var ligature: ?Renderer.PositionedGlyph = null;
+        var icon: ?Renderer.PositionedGlyph = null;
+        var base_y: i64 = 0;
+        for (glyphs) |g| {
+            try expectGlyphColumns(&renderer, &screen, 0, g);
+            if (g.column == 0) {
+                try t.expect(g.x > 0);
+                try t.expect(g.width < renderer.cell_width * scale);
+            }
+            if (g.column == 3) {
+                if (marks == 0) base_y = g.y else try t.expect(g.y < base_y);
+                marks += 1;
+            }
+            if (g.column == 4) ligature = g;
+            if (g.column == 6) try t.expectEqual(@as(usize, 8), g.end);
+            if (g.column == 9) icon = g;
+        }
+        try t.expectEqual(@as(usize, 2), marks);
+        try t.expect(ligature != null and icon != null);
+        try t.expectEqual(@as(usize, 6), ligature.?.end);
+        try t.expectEqual(ligature.?.id, icon.?.id);
+        try t.expect(ligature.?.width > icon.?.width);
+        const shaped = renderer.shaped_rows;
+        _ = try renderer.shapeRow(&screen, 0);
+        try t.expectEqual(shaped, renderer.shaped_rows);
+    }
+    try t.expectEqual(@as(u2, 2), screen.getCell(0, 6).?.width);
+    try t.expectEqual(@as(u2, 1), screen.getCell(0, 9).?.width);
+}
+
+test "Nerd icons retain all four outline edges and never prefer loaded color fonts for private use" {
+    var renderer = try Renderer.initFontDirectory(t.allocator, "Vertex Test Proportional,Vertex Test Color", "tests/fonts");
+    defer renderer.deinit();
+    var screen = try vt.Screen.init(t.allocator, 1, 9);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    // The ligature primes the atlas with the same glyph at a different size.
+    parser.feed("😀ii\u{e0b0}A\u{f0001}A\u{100001}\x1b[?25l", &screen);
+    for ([_]usize{ 1, 2 }) |scale| {
+        try renderer.setScale(scale);
+        const width = screen.columns * renderer.cell_width * scale;
+        const height = renderer.cell_height * scale;
+        const pixels = try t.allocator.alloc(u32, width * height);
+        defer t.allocator.free(pixels);
+        try renderer.draw(&screen, pixels, width, height);
+        var icons: usize = 0;
+        for (try renderer.shapeRow(&screen, 0)) |g| {
+            if (g.column != 4 and g.column != 6 and g.column != 8) continue;
+            icons += 1;
+            try t.expectEqual(@as(usize, 0), g.face);
+            try expectGlyphColumns(&renderer, &screen, 0, g);
+            try t.expect(g.y >= 0 and @divFloor(g.y, 64) + @as(i64, @intCast(g.height)) <= height);
+            const x: usize = @intCast(@divFloor(g.x, 64));
+            const y: usize = @intCast(@divFloor(g.y, 64));
+            for ([_]usize{ y, y + g.height - 1 }) |edge_y| {
+                for ([_]usize{ x, x + g.width - 1 }) |edge_x| try t.expect(pixels[edge_y * width + edge_x] != Renderer.default_background);
+            }
+            try t.expectEqual(Renderer.default_background, pixels[(y + g.height / 2) * width + x + g.width / 2]);
+        }
+        try t.expectEqual(@as(usize, 3), icons);
+        // Identical BMP and supplementary icons produce identical cell images.
+        const cw = renderer.cell_width * scale;
+        for (0..height) |y| try t.expectEqualSlices(u32, pixels[y * width + 4 * cw ..][0..cw], pixels[y * width + 6 * cw ..][0..cw]);
+    }
+}
+
+test "Nerd symbols fall back from a monospace face without changing terminal advances" {
+    var renderer = try Renderer.initFontDirectory(t.allocator, "Vertex Test Mono,Vertex Test Icons", "tests/fonts");
+    defer renderer.deinit();
+    var screen = try vt.Screen.init(t.allocator, 1, 5);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("A\u{e0b0}A\u{f0001}", &screen);
+    try t.expectEqual(@as(usize, 4), screen.cursor.column);
+    for (try renderer.shapeRow(&screen, 0)) |g| {
+        if (g.column == 1 or g.column == 3) {
+            try t.expect(g.face != 0 and g.id != 0);
+            try t.expect(renderer.faces.items[g.face - 1].face.*.face_flags & c.FT_FACE_FLAG_COLOR == 0);
+            try t.expectEqual(g.column + 1, g.end);
+            try expectGlyphColumns(&renderer, &screen, 0, g);
+        }
+    }
+}
+
+test "fitted glyph sizes match CPU GPU and incremental redraws across styles bidi and scale" {
+    var renderer = try Renderer.initFontDirectory(t.allocator, "Vertex Test Proportional", "tests/fonts");
+    defer renderer.deinit();
+    var reference = try Renderer.initFontDirectory(t.allocator, "Vertex Test Proportional", "tests/fonts");
+    defer reference.deinit();
+    renderer.bidi = true;
+    reference.bidi = true;
+    var screen = try vt.Screen.init(t.allocator, 2, 12);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("ii\u{e0b0}iW\u{f0001}A\u{301}\r\nאבA\u{e0b0}\x1b[?25l", &screen);
+    const width = screen.columns * renderer.cell_width * 2;
+    const height = screen.rows * renderer.cell_height * 2;
+    const pixels = try t.allocator.alloc(u32, width * height);
+    defer t.allocator.free(pixels);
+    const expected = try t.allocator.alloc(u32, width * height);
+    defer t.allocator.free(expected);
+    @memset(pixels, Renderer.default_background);
+    var gpu = @import("renderer/Gpu.zig").initHeadless(t.allocator, width, height) catch |err| {
+        if (c.getenv("VERTEX_TEST_GPU") != null) return err;
+        return error.SkipZigTest;
+    };
+    defer gpu.deinit();
+    var damage = Renderer.Damage.init(t.allocator);
+    defer damage.deinit();
+    for ([_][]const u8{
+        "", "\x1b[1;3H\x1b[1;3m\u{e0b0}\x1b[0m", "\x1b[1;2H\x1b[?25h", "\x1b[?25l", "\x1b[2;1HA\u{301}", "\x1b[1;1HWO",
+    }, 0..) |edit, step| {
+        if (step == 3) {
+            renderer.atlas.clear();
+            renderer.metrics.clearRetainingCapacity();
+            damage.invalidate();
+        }
+        if (step == 4) {
+            try renderer.setScale(2);
+            try reference.setScale(2);
+            damage.invalidate();
+        }
+        parser.feed(edit, &screen);
+        _ = try damage.prepare(&screen, width, height, renderer.cell_height * renderer.scale);
+        try renderer.drawRows(&screen, pixels, width, height, damage.rows);
+        try gpu.render(&renderer, &screen, &damage);
+        try reference.draw(&screen, expected, width, height);
+        try t.expectEqualSlices(u32, expected, pixels);
+        try expectGpuPixels(&gpu, pixels);
+        damage.commit(&screen);
+    }
 }
 
 test "incremental CPU and GPU frames match full redraws through edits cursor scroll and scale" {

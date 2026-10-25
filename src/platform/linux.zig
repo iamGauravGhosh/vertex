@@ -50,11 +50,12 @@ pub fn run(allocator: std.mem.Allocator, command: []const []const u8) !u8 {
         std.debug.print("vertex: VERTEX_RENDERER must be auto, gpu, or cpu\n", .{});
         return error.InvalidRenderer;
     };
+    const font_name = c.getenv("VERTEX_FONT");
     var app: App = .{
         .allocator = allocator,
         .clipboard = .{ .allocator = allocator },
         .ime = .{ .allocator = allocator },
-        .renderer = try Renderer.init(allocator),
+        .renderer = try Renderer.initConfigured(allocator, if (font_name != null) std.mem.span(font_name) else null),
         .screen = undefined,
         .session = undefined,
         .mode = mode,

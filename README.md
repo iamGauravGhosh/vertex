@@ -46,7 +46,7 @@ URLs opened through Ctrl+click. See [hyperlinks and images](docs/media.md).
 - `pkg-config`, `wayland-scanner`, `wayland-protocols`, and development libraries
   for Wayland/wayland-egl, xkbcommon, FreeType, Fontconfig, HarfBuzz, EGL,
   OpenGL ES 3, FriBidi, and libc/PTYs.
-- An installed monospace font, resolved through Fontconfig.
+- An installed font, resolved through Fontconfig; the default family is `monospace`.
 - Python 3 and Weston for executable/window smoke checks in CI.
 
 On Debian/Ubuntu, GUI development dependencies are `libwayland-dev`,
@@ -83,7 +83,7 @@ The archive contains `vertex`, `README.md`, and `LICENSE` in a matching director
 The executable is built with Zig 0.17.0 in ReleaseSafe mode for a baseline x86_64
 CPU on Ubuntu 24.04. It needs a compatible Linux/glibc system, a Wayland compositor,
 Wayland client/EGL libraries, xkbcommon, FreeType, Fontconfig, HarfBuzz, FriBidi, EGL,
-OpenGL ES libraries, and a monospace font. `xdg-open` is needed to open links.
+OpenGL ES libraries, and an installed font. `xdg-open` is needed to open links.
 EGL/GLES libraries are required even
 when selecting CPU rendering; an available GPU driver is optional in auto mode.
 On Ubuntu 24.04, install the runtime dependencies with:
@@ -130,6 +130,27 @@ GPU rendering, then permanently switches to CPU for the session if graphics
 initialization or rendering fails. `gpu` reports graphics failures directly;
 `cpu` bypasses EGL initialization. For example: `VERTEX_RENDERER=cpu zig-out/bin/vertex`.
 
+Set `VERTEX_FONT` to an installed font family or Fontconfig pattern before launch:
+
+```sh
+VERTEX_FONT="JetBrainsMono Nerd Font Mono" zig-out/bin/vertex
+VERTEX_FONT="JetBrainsMono Nerd Font Propo" zig-out/bin/vertex
+VERTEX_FONT="Noto Sans" zig-out/bin/vertex
+```
+
+An unset or empty value selects `monospace`. Fontconfig substitutes unavailable
+families and supplies fallback glyphs. Use `fc-list : family` to find installed
+families. Nerd Font Mono, regular Nerd Font, and Propo variants are supported;
+install a patched font or a symbols font such as Symbols Nerd Font Mono for
+Nerd Font icons. Vertex does not download or bundle fonts.
+
+All fonts use the terminal's fixed column grid. Proportional glyphs are centered
+within their assigned cells; overflowing clusters shrink without enlarging narrow
+glyphs. Private-use icons preserve their aspect ratio and fit completely inside
+their cells, including supplementary Nerd Font icons. Unicode column widths,
+cursor movement, and mouse coordinates stay independent of font advances. Fonts
+use 16 logical pixels and follow display scaling; restart Vertex to change fonts.
+
 The default shell is `$SHELL`, then the account shell, then `/bin/sh`. Vertex
 inherits the working directory and environment and sets `TERM=xterm-256color`
 and `COLORTERM=truecolor`. Exiting the shell closes the window; the shell's exit
@@ -161,8 +182,8 @@ shows parser-to-screen integration and supported controls.
 
 The terminal targets basic shell work, including command editing, history,
 completion, Ctrl shortcuts, and output scrolling. It starts at 80×24 cells unless
-the compositor assigns another size. Fonts use 16 logical pixels; appearance is
-currently fixed. Resizing preserves the top-left overlap without reflow and
+the compositor assigns another size. Font size is fixed at 16 logical pixels;
+the family is selected with `VERTEX_FONT`. Resizing preserves the top-left overlap without reflow and
 notifies the PTY. There are no client-side decorations; use compositor shortcuts
 for moving, resizing, and closing the window.
 

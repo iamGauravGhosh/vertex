@@ -16,8 +16,11 @@ pub const PositionedGlyph = struct {
     face: usize = 0,
     column: usize,
     end: usize,
+    /// Fitted bitmap top-left, in 26.6 pixels relative to the row.
     x: i64,
     y: i64,
+    width: usize = 0,
+    height: usize = 0,
     style: vt.Style,
 };
 const Face = struct { face: c.FT_Face, font: *c.hb_font_t, index: usize };
@@ -65,6 +68,11 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
     return initFont(allocator, "monospace");
 }
 
+/// Launch settings are injected so explicit font initializers stay deterministic.
+pub fn initConfigured(allocator: std.mem.Allocator, name: ?[:0]const u8) !Renderer {
+    return initFont(allocator, if (name) |value| (if (value.len != 0) value else "monospace") else "monospace");
+}
+
 /// An explicit Fontconfig pattern also permits deterministic font tests.
 pub fn initFont(allocator: std.mem.Allocator, name: [:0]const u8) !Renderer {
     return initFontDirectory(allocator, name, null);
@@ -95,8 +103,8 @@ pub fn initFontDirectory(allocator: std.mem.Allocator, name: [:0]const u8, direc
     if (c.FT_New_Face(library, @ptrCast(filename), face_index, &face) != 0) return error.FontLoadFailed;
     errdefer _ = c.FT_Done_Face(face);
     if (c.FT_Set_Pixel_Sizes(face, 0, 16) != 0) return error.FontSizeFailed;
-    if (c.FT_Load_Char(face, 'M', c.FT_LOAD_DEFAULT) != 0) return error.GlyphLoadFailed;
     const m = face.*.size.*.metrics;
+    const advance = if (c.FT_Get_Char_Index(face, 'M') != 0 and c.FT_Load_Char(face, 'M', c.FT_LOAD_DEFAULT) == 0 and face.*.glyph.*.advance.x > 0) face.*.glyph.*.advance.x else m.max_advance;
     const font = c.hb_ft_font_create_referenced(face) orelse return error.OutOfMemory;
     errdefer c.hb_font_destroy(font);
     const buffer = c.hb_buffer_create() orelse return error.OutOfMemory;
@@ -109,7 +117,7 @@ pub fn initFontDirectory(allocator: std.mem.Allocator, name: [:0]const u8, direc
         .font = font,
         .fallbacks = fallbacks,
         .buffer = buffer,
-        .cell_width = @intCast(@max(1, @divTrunc(face.*.glyph.*.advance.x + 63, 64))),
+        .cell_width = @intCast(@max(1, @divTrunc(advance + 63, 64))),
         .cell_height = @intCast(@max(1, @divTrunc(m.height + 63, 64))),
         .ascent = @intCast(@divTrunc(m.ascender + 63, 64)),
         .atlas = Atlas.init(allocator),
@@ -196,7 +204,7 @@ fn faceFor(self: *Renderer, cluster: []const u21) !usize {
 }
 fn findFace(self: *Renderer, cluster: []const u21) !usize {
     var emoji = false;
-    for (cluster) |cp| if (cp == 0xfe0f or cp >= 0x1f000) {
+    for (cluster) |cp| if (cp == 0xfe0f or vt.Unicode.isEmojiPresentation(cp)) {
         emoji = true;
     };
     if (!emoji and supports(self.face, cluster)) return 0;
@@ -395,7 +403,7 @@ pub fn shapeRow(self: *Renderer, screen: *const vt.Screen, index: usize) ![]cons
                 end += 1;
                 continue;
             }
-            if (!std.meta.eql(cells[end].style, cells[start].style) or scripts[end] != script or @mod(levels[end], 2) != @mod(levels[start], 2) or try self.faceFor(screen.getGrapheme(index, end).?) != face_index) break;
+            if (privateUse(cells[start].codepoint) or privateUse(cells[end].codepoint) or !std.meta.eql(cells[end].style, cells[start].style) or scripts[end] != script or @mod(levels[end], 2) != @mod(levels[start], 2) or try self.faceFor(screen.getGrapheme(index, end).?) != face_index) break;
             end += cells[end].width;
         }
         c.hb_buffer_reset(self.buffer);
@@ -425,6 +433,7 @@ pub fn shapeRow(self: *Renderer, screen: *const vt.Screen, index: usize) ![]cons
             var visual = row.visual.items[column];
             for (column..@max(column + cells[column].width, cluster_end)) |col| visual = @min(visual, row.visual.items[col]);
             var pen: i64 = 0;
+            const first_glyph = row.glyphs.items.len;
             const numerator: i64 = if (selected.face.*.face_flags & c.FT_FACE_FLAG_SCALABLE == 0) @intCast(16 * self.scale) else 1;
             const denominator: i64 = if (numerator != 1) @max(1, selected.face.*.size.*.metrics.y_ppem) else 1;
             for (i..next) |j| {
@@ -433,12 +442,13 @@ pub fn shapeRow(self: *Renderer, screen: *const vt.Screen, index: usize) ![]cons
                     .face = face_index,
                     .column = column,
                     .end = @max(column + cells[column].width, cluster_end),
-                    .x = @as(i64, @intCast(visual * self.cell_width * self.scale)) * 64 + pen + @divTrunc(@as(i64, positions[j].x_offset) * numerator, denominator),
+                    .x = pen + @divTrunc(@as(i64, positions[j].x_offset) * numerator, denominator),
                     .y = -@divTrunc(@as(i64, positions[j].y_offset) * numerator, denominator),
                     .style = cells[start].style,
                 });
                 pen += @divTrunc(@as(i64, positions[j].x_advance) * numerator, denominator);
             }
+            try self.fitCluster(row.glyphs.items[first_glyph..], visual, pen, privateUse(cells[column].codepoint));
             i = next;
         }
         start = end;
@@ -465,6 +475,75 @@ pub fn logicalColumn(self: *Renderer, screen: *const vt.Screen, row: usize, visu
 fn visualCached(self: *const Renderer, screen: *const vt.Screen, row: usize, column: usize) usize {
     const head = if (screen.getCell(row, column).?.width == 0 and column > 0) column - 1 else column;
     return self.rows[row].visual.items[head] + column - head;
+}
+
+fn privateUse(cp: u21) bool {
+    return (cp >= 0xe000 and cp <= 0xf8ff) or (cp >= 0xf0000 and cp <= 0xffffd) or (cp >= 0x100000 and cp <= 0x10fffd);
+}
+
+fn glyphKey(g: PositionedGlyph) u64 {
+    return (@as(u64, @intCast(g.face)) << 40) | @as(u64, g.id) | (@as(u64, @intFromBool(g.style.bold)) << 32) | (@as(u64, @intFromBool(g.style.italic)) << 33);
+}
+
+fn glyphMetrics(self: *Renderer, g: PositionedGlyph) !Metrics {
+    const key = glyphKey(g);
+    if (self.metrics.get(key)) |m| return m;
+    const m = try self.load(g.face, g.id, g.style);
+    if (self.metrics.count() >= 4096) self.metrics.clearRetainingCapacity();
+    try self.metrics.put(key, m);
+    return m;
+}
+
+/// Transform a complete HB cluster together, retaining mark and ligature geometry.
+/// Raster bounds include bearings and synthetic styles, not just advance widths.
+fn fitCluster(self: *Renderer, glyphs: []PositionedGlyph, visual: usize, advance: i64, icon: bool) !void {
+    var left: i64 = std.math.maxInt(i64);
+    var right: i64 = std.math.minInt(i64);
+    var top: i64 = std.math.maxInt(i64);
+    var bottom: i64 = std.math.minInt(i64);
+    for (glyphs) |*g| {
+        const m = try self.glyphMetrics(g.*);
+        g.x = @divFloor(g.x, 64) + m.left;
+        g.y = @divFloor(g.y, 64) - m.top;
+        g.width = m.width;
+        g.height = m.height;
+        if (m.width == 0 or m.height == 0) continue;
+        left = @min(left, g.x);
+        right = @max(right, g.x + @as(i64, @intCast(m.width)));
+        top = @min(top, g.y);
+        bottom = @max(bottom, g.y + @as(i64, @intCast(m.height)));
+    }
+    if (left == std.math.maxInt(i64)) return;
+    const first = glyphs[0];
+    const width: i64 = @intCast((first.end - first.column) * self.cell_width * self.scale);
+    const height: i64 = @intCast(self.cell_height * self.scale);
+    if (!icon) {
+        left = @min(0, left);
+        right = @max(@as(i64, @intCast((@abs(advance) + 63) / 64)), right);
+    }
+    var numerator: i64 = 1;
+    var denominator: i64 = 1;
+    if (right - left > width) {
+        numerator = width;
+        denominator = right - left;
+    }
+    if (icon and (bottom - top) * numerator > height * denominator) {
+        numerator = height;
+        denominator = bottom - top;
+    }
+    const proportional = self.fontFace(first.face).face.*.face_flags & c.FT_FACE_FLAG_FIXED_WIDTH == 0;
+    const padding_x = if (icon or proportional or numerator != denominator) @divFloor(width - @divFloor((right - left) * numerator, denominator), 2) else 0;
+    const origin_x: i64 = @as(i64, @intCast(visual * self.cell_width * self.scale)) + padding_x;
+    const origin_y: i64 = if (icon) @divFloor(height - @divFloor((bottom - top) * numerator, denominator), 2) else self.ascent * @as(i64, @intCast(self.scale));
+    for (glyphs) |*g| {
+        const x = @divFloor((g.x - left) * numerator, denominator);
+        const y = @divFloor((g.y - (if (icon) top else @as(i64, 0))) * numerator, denominator);
+        // Map shared edges consistently, including adjacent glyphs in one cluster.
+        g.width = if (g.width == 0) 0 else @intCast(@max(1, @divFloor((g.x + @as(i64, @intCast(g.width)) - left) * numerator, denominator) - x));
+        g.height = if (g.height == 0) 0 else @intCast(@max(1, @divFloor((g.y + @as(i64, @intCast(g.height)) - (if (icon) top else @as(i64, 0))) * numerator, denominator) - y));
+        g.x = (origin_x + x) * 64;
+        g.y = (origin_y + y) * 64;
+    }
 }
 
 fn load(self: *Renderer, face_index: usize, id: u32, style: vt.Style) !Metrics {
@@ -522,50 +601,35 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
         try self.paintImages(screen, row, 1, painter);
         for (glyphs) |g| {
             if (g.style.hidden) continue;
-            const key = (@as(u64, @intCast(g.face)) << 40) | @as(u64, g.id) | (@as(u64, @intFromBool(g.style.bold)) << 32) | (@as(u64, @intFromBool(g.style.italic)) << 33);
+            const key = glyphKey(g);
             var loaded = false;
-            const m = self.metrics.get(key) orelse blk: {
-                const m = try self.load(g.face, g.id, g.style);
-                loaded = true;
-                if (self.metrics.count() >= 4096) self.metrics.clearRetainingCapacity();
-                try self.metrics.put(key, m);
-                break :blk m;
-            };
             var ty: usize = 0;
-            while (ty < m.height) : (ty += Atlas.tile_size) {
+            while (ty < g.height) : (ty += Atlas.tile_size) {
                 var tx: usize = 0;
-                while (tx < m.width) : (tx += Atlas.tile_size) {
-                    const tile_key: Atlas.Key = .{ .glyph = key, .x = @intCast(tx), .y = @intCast(ty) };
+                while (tx < g.width) : (tx += Atlas.tile_size) {
+                    const tile_key: Atlas.Key = .{ .glyph = key, .width = @intCast(g.width), .height = @intCast(g.height), .x = @intCast(tx), .y = @intCast(ty) };
                     const region = self.atlas.get(tile_key) orelse blk: {
                         if (!loaded) {
                             _ = try self.load(g.face, g.id, g.style);
                             loaded = true;
                         }
                         const bitmap = self.fontFace(g.face).face.*.glyph.*.bitmap;
-                        const tw: usize = @min(Atlas.tile_size, m.width - tx);
-                        const th: usize = @min(Atlas.tile_size, m.height - ty);
+                        const tw: usize = @min(Atlas.tile_size, g.width - tx);
+                        const th: usize = @min(Atlas.tile_size, g.height - ty);
                         // Only a bounded tile scratch buffer, including for very large glyphs.
                         const is_color = bitmap.pixel_mode == c.FT_PIXEL_MODE_BGRA;
                         const channels: usize = if (is_color) 4 else 1;
                         try self.raster_scratch.resize(self.allocator, tw * th * channels);
                         const scratch = self.raster_scratch.items;
-                        const pitch: usize = @intCast(@abs(bitmap.pitch));
                         for (0..th) |by| {
-                            const original_y = (ty + by) * bitmap.rows / m.height;
-                            const sy = if (bitmap.pitch < 0) bitmap.rows - 1 - original_y else original_y;
                             for (0..tw) |bx| {
-                                const sx = (tx + bx) * bitmap.width / m.width;
+                                const texel = try rasterPixel(bitmap, tx + bx, ty + by, g.width, g.height);
                                 if (is_color) {
-                                    const source = bitmap.buffer[sy * pitch + sx * 4 ..][0..4];
                                     const target = scratch[(by * tw + bx) * 4 ..][0..4];
-                                    target.* = .{ source[2], source[1], source[0], source[3] };
+                                    target.* = texel;
                                     continue;
                                 }
-                                scratch[by * tw + bx] = switch (bitmap.pixel_mode) {
-                                    c.FT_PIXEL_MODE_MONO => if ((bitmap.buffer[sy * pitch + sx / 8] & (@as(u8, 0x80) >> @intCast(sx % 8))) != 0) 255 else 0,
-                                    c.FT_PIXEL_MODE_GRAY => bitmap.buffer[sy * pitch + sx],
-                                    else => return error.UnsupportedGlyphBitmap,
-                                };
+                                scratch[by * tw + bx] = texel[3];
                             }
                         }
                         try painter.flush();
@@ -573,8 +637,8 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
                         try painter.upload(&self.atlas, region);
                         break :blk region;
                     };
-                    const dx: i32 = @intCast(@divFloor(g.x, 64) + m.left + @as(i64, @intCast(tx)));
-                    const dy: i32 = @intCast(y + self.ascent * @as(i32, @intCast(self.scale)) - m.top + @divFloor(g.y, 64) + @as(i64, @intCast(ty)));
+                    const dx: i32 = @intCast(@divFloor(g.x, 64) + @as(i64, @intCast(tx)));
+                    const dy: i32 = @intCast(y + @divFloor(g.y, 64) + @as(i64, @intCast(ty)));
                     // Per-cell clips preserve cursor colors even inside a single ligature.
                     for (g.column..g.end) |col| {
                         const rgb = colors(g.style, cursor.visible and cursor.shape == .block and cursor.row == row and cursor.column == col);
@@ -607,6 +671,44 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
         }
     }
     try painter.flush();
+}
+
+fn bitmapPixel(bitmap: c.FT_Bitmap, x: usize, y: usize) ![4]u8 {
+    const pitch: usize = @intCast(@abs(bitmap.pitch));
+    const row = (if (bitmap.pitch < 0) bitmap.rows - 1 - y else y) * pitch;
+    if (bitmap.pixel_mode == c.FT_PIXEL_MODE_BGRA) {
+        const pixel = bitmap.buffer[row + x * 4 ..][0..4];
+        return .{ pixel[2], pixel[1], pixel[0], pixel[3] };
+    }
+    const alpha = switch (bitmap.pixel_mode) {
+        c.FT_PIXEL_MODE_MONO => @as(u8, if (bitmap.buffer[row + x / 8] & (@as(u8, 0x80) >> @intCast(x % 8)) != 0) 255 else 0),
+        c.FT_PIXEL_MODE_GRAY => bitmap.buffer[row + x],
+        else => return error.UnsupportedGlyphBitmap,
+    };
+    return @splat(alpha);
+}
+
+/// Area coverage retains thin strokes when wide icons shrink into a single cell.
+/// Sampling premultiplied channels also preserves color-glyph transparency.
+fn rasterPixel(bitmap: c.FT_Bitmap, x: usize, y: usize, width: usize, height: usize) ![4]u8 {
+    if (width == bitmap.width and height == bitmap.rows) return bitmapPixel(bitmap, x, y);
+    const x0 = x * bitmap.width;
+    const x1 = (x + 1) * bitmap.width;
+    const y0 = y * bitmap.rows;
+    const y1 = (y + 1) * bitmap.rows;
+    var sums: [4]u64 = @splat(0);
+    for (y0 / height..(y1 + height - 1) / height) |sy| {
+        const wy = @min(y1, (sy + 1) * height) - @max(y0, sy * height);
+        for (x0 / width..(x1 + width - 1) / width) |sx| {
+            const wx = @min(x1, (sx + 1) * width) - @max(x0, sx * width);
+            const pixel = try bitmapPixel(bitmap, sx, sy);
+            for (&sums, pixel) |*sum, channel| sum.* += @as(u64, channel) * wx * wy;
+        }
+    }
+    const area = @as(u64, bitmap.width) * bitmap.rows;
+    var pixel: [4]u8 = undefined;
+    for (&pixel, sums) |*channel, sum| channel.* = @intCast((sum + area / 2) / area);
+    return pixel;
 }
 
 fn paintImages(self: *Renderer, screen: *const vt.Screen, row: usize, layer: u2, painter: anytype) !void {

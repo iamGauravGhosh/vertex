@@ -46,7 +46,19 @@ latch them for retrieval after a feed. See [the parser guide](vt-parser.md) for 
 Each row caches shaped glyph IDs, font identity, positions, source cell spans,
 and a content fingerprint. Unicode 15.1 graphemes occupy one or two columns;
 continuation cells are never shaped independently. Fontconfig supplies fallback
-faces for complete clusters. HarfBuzz shapes script/style/font/direction runs.
+faces for complete clusters. The GUI injects `VERTEX_FONT` at startup, defaulting
+to `monospace`; explicit renderer initializers ignore the environment. Monospace
+and proportional faces both use the primary font's `M` advance for cell width,
+with a positive metrics fallback when `M` is unavailable. HarfBuzz shapes
+script/style/font/direction runs. Private-use icons form separate runs and do not
+trigger emoji font preference; actual Unicode emoji-presentation characters do.
+
+Raster ink bounds and advances determine fitting for each complete shaped
+cluster. Proportional clusters are centered in their assigned columns, and
+overflowing clusters shrink uniformly while preserving mark offsets and ordinary
+text baselines. Private-use icons fit both cell dimensions and are centered
+vertically. Fitted bitmap dimensions and positions are cached in the row; Unicode
+column widths and input coordinate mapping remain independent of font advances.
 `VERTEX_BIDI=auto` uses FriBidi to resolve soft-wrapped logical paragraphs, then
 reorders each physical row while retaining logical-to-visual column mappings.
 The default `off` preserves fixed visual columns. Bidi paragraph edits invalidate
@@ -56,7 +68,10 @@ FreeType rasterizes masks and color bitmaps/COLRv0 glyphs into four bounded,
 lazily allocated 1024×1024 RGBA atlas pages (16 MiB total pixel storage). Masks
 store premultiplied white; color glyphs retain premultiplied RGBA. Shelf packing,
 LRU recycling, padding, and bounded tiled scratch storage remain shared between
-CPU and GPU. Glyph cache keys include face and style. Both backends composite
+CPU and GPU. Raw glyph metrics are cached by face and style; atlas keys also
+include fitted raster dimensions, so a glyph shared by a multi-cell ligature and
+a single-cell icon cannot reuse the wrong bitmap. Shared area resampling retains
+thin strokes and premultiplied color before atlas upload. Both backends composite
 premultiplied pixels; the GPU flushes pending batches before atlas reuse.
 Row caches retain content fingerprints rather than pointers into mutable cluster
 storage. Scale changes resize all loaded faces and invalidate rows and atlases.

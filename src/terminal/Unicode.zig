@@ -1,6 +1,10 @@
 //! Extended grapheme boundaries (UAX #29) and terminal cluster widths.
 pub const data = @import("unicode_data.zig");
 pub const version = data.version;
+pub fn isEmojiPresentation(cp: u21) bool {
+    return lookup(&data.emoji, cp) != 0;
+}
+
 fn lookup(ranges: []const data.Range, cp: u21) u8 {
     var lo: usize = 0;
     var hi = ranges.len;

@@ -24,7 +24,7 @@ def wait_for(predicate, message, seconds=10):
     raise AssertionError(message)
 
 
-def check_window(width, height, scale, renderer="gpu", fail_gpu=False):
+def check_window(width, height, scale, renderer="gpu", fail_gpu=False, font=None):
     with tempfile.TemporaryDirectory(prefix="vertex-wayland-") as temporary:
         root = Path(temporary)
         environment = os.environ.copy()
@@ -32,6 +32,9 @@ def check_window(width, height, scale, renderer="gpu", fail_gpu=False):
         environment.update(XDG_RUNTIME_DIR=temporary, WAYLAND_DISPLAY="vertex-test")
         environment.pop("__EGL_VENDOR_LIBRARY_FILENAMES", None)
         environment.update(VERTEX_RENDERER=renderer, LIBGL_ALWAYS_SOFTWARE="1")
+        environment.pop("VERTEX_FONT", None)
+        if font is not None:
+            environment["VERTEX_FONT"] = font
         with (root / "weston.log").open("w+") as compositor_log:
             weston = subprocess.Popen(
                 ["weston", "--backend=headless-backend.so", "--renderer=pixman",
@@ -124,7 +127,7 @@ def check_window(width, height, scale, renderer="gpu", fail_gpu=False):
 large = check_window(800, 600, 1)
 small = check_window(640, 480, 1)
 assert small[0] < large[0] and small[1] < large[1], (large, small)
-check_window(1280, 960, 2)
+check_window(1280, 960, 2, font="sans")
 
-check_window(800, 600, 1, renderer="cpu")
-check_window(800, 600, 1, renderer="auto", fail_gpu=True)
+check_window(800, 600, 1, renderer="cpu", font="sans")
+check_window(800, 600, 1, renderer="auto", fail_gpu=True, font="Vertex Deliberately Unavailable Font")
