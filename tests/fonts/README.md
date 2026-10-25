@@ -15,3 +15,9 @@ They are not intended for user-facing text. The frame's four thick edges and
 empty center distinguish complete fitting from clipping in pixel assertions.
 
 Normal builds/tests use the committed fonts and need no Python packages.
+
+`styled-regular.ttf`, `styled-bold.ttf`, `styled-italic.ttf`, and
+`styled-bolditalic.ttf` form a real four-face family (`Vertex Test Styled`).
+Distinct outlines and style flags test style selection before shaping. U+E700
+in the icon fixtures tests ordinary private-use glyphs independently of the
+procedurally rendered Powerline separators.

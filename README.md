@@ -130,26 +130,41 @@ GPU rendering, then permanently switches to CPU for the session if graphics
 initialization or rendering fails. `gpu` reports graphics failures directly;
 `cpu` bypasses EGL initialization. For example: `VERTEX_RENDERER=cpu zig-out/bin/vertex`.
 
-Set `VERTEX_FONT` to an installed font family or Fontconfig pattern before launch:
+Font settings are read at startup from `$XDG_CONFIG_HOME/vertex/config`, or
+`~/.config/vertex/config` when XDG_CONFIG_HOME is unset or relative. For example,
+to match Kitty with JetBrainsMonoNL Nerd Font at 13 points:
 
-```sh
-VERTEX_FONT="JetBrainsMono Nerd Font Mono" zig-out/bin/vertex
-VERTEX_FONT="JetBrainsMono Nerd Font Propo" zig-out/bin/vertex
-VERTEX_FONT="Noto Sans" zig-out/bin/vertex
+```ini
+font_family = JetBrainsMonoNL Nerd Font
+font_size = 13
 ```
 
-An unset or empty value selects `monospace`. Fontconfig substitutes unavailable
-families and supplies fallback glyphs. Use `fc-list : family` to find installed
-families. Nerd Font Mono, regular Nerd Font, and Propo variants are supported;
-install a patched font or a symbols font such as Symbols Nerd Font Mono for
-Nerd Font icons. Vertex does not download or bundle fonts.
+See [the example config](assets/font-config.example). Font families may also be
+Fontconfig patterns. Size accepts fractional values from 4 to 128 points, at 96
+logical DPI. An absent config uses `monospace` at 12 points (16 logical pixels).
+Malformed settings produce a startup diagnostic. Restart Vertex after changes.
 
-All fonts use the terminal's fixed column grid. Proportional glyphs are centered
-within their assigned cells; overflowing clusters shrink without enlarging narrow
-glyphs. Private-use icons preserve their aspect ratio and fit completely inside
-their cells, including supplementary Nerd Font icons. Unicode column widths,
-cursor movement, and mouse coordinates stay independent of font advances. Fonts
-use 16 logical pixels and follow display scaling; restart Vertex to change fonts.
+`VERTEX_FONT` and `VERTEX_FONT_SIZE` override individual config settings:
+
+```sh
+VERTEX_FONT="JetBrainsMonoNL Nerd Font" VERTEX_FONT_SIZE=13 zig-out/bin/vertex
+VERTEX_FONT="JetBrainsMono Nerd Font Mono" zig-out/bin/vertex
+VERTEX_FONT="JetBrainsMono Nerd Font Propo" zig-out/bin/vertex
+```
+
+An empty VERTEX_FONT selects `monospace`; an empty VERTEX_FONT_SIZE leaves the
+configured size unchanged. Fontconfig substitutes unavailable families and supplies
+fallback glyphs. Use `fc-list : family` to find installed families. Install a
+patched Nerd Font or a symbols font for Nerd Font icons. Vertex does not download
+or bundle fonts. Real bold/italic faces are selected when available, with synthetic
+styles as a fallback.
+
+Text uses a fixed column grid, independently of font advances. Proportional
+clusters are centered and overflowing clusters shrink together, preserving
+combining marks. Wide private-use icons may borrow one adjacent plain space with
+the same style and hyperlink; neighboring text and cursor positions remain fixed.
+Box drawing, blocks, Braille, and basic Powerline separators are drawn directly
+on the grid, keeping borders and block artwork connected at every integer scale.
 
 The default shell is `$SHELL`, then the account shell, then `/bin/sh`. Vertex
 inherits the working directory and environment and sets `TERM=xterm-256color`
@@ -182,8 +197,8 @@ shows parser-to-screen integration and supported controls.
 
 The terminal targets basic shell work, including command editing, history,
 completion, Ctrl shortcuts, and output scrolling. It starts at 80×24 cells unless
-the compositor assigns another size. Font size is fixed at 16 logical pixels;
-the family is selected with `VERTEX_FONT`. Resizing preserves the top-left overlap without reflow and
+the compositor assigns another size. Font family and point size are configured at startup
+through the config file or environment overrides. Resizing preserves the top-left overlap without reflow and
 notifies the PTY. There are no client-side decorations; use compositor shortcuts
 for moving, resizing, and closing the window.
 

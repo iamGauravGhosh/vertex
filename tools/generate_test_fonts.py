@@ -67,7 +67,7 @@ def frame():
 for proportional in (False, True):
     name = 'Vertex Test Proportional' if proportional else 'Vertex Test Icons'
     glyphs = {'.notdef': rectangle(50, 0, 550, 700), 'wide': frame()}
-    cmap = {0xe0b0: 'wide', 0xf0001: 'wide', 0x100001: 'wide'}
+    cmap = {0xe0b0: 'wide', 0xe700: 'wide', 0xf0001: 'wide', 0x100001: 'wide'}
     advances = {'.notdef': 600, 'wide': 1600}
     if proportional:
         glyphs.update({'space': TTGlyphPen(None).glyph(), 'M': rectangle(50, 0, 550, 700),
@@ -101,3 +101,29 @@ for proportional in (False, True):
     builder.font['head'].modified = 3800000000
     builder.font.recalcTimestamp = False
     builder.save(root / ('proportional.ttf' if proportional else 'icons.ttf'))
+
+# A real four-face family distinguishes style selection from synthetic transforms.
+for bold, italic in ((False, False), (True, False), (False, True), (True, True)):
+    family = 'Vertex Test Styled'
+    style = ('Bold' if bold else '') + ('Italic' if italic else '') or 'Regular'
+    builder = FontBuilder(1000, isTTF=True)
+    glyphs = {'.notdef': rectangle(50, 0, 550, 700), 'space': TTGlyphPen(None).glyph(),
+              'M': rectangle(50, 0, 550, 700),
+              'A': rectangle(50, 0, 550 if bold else 400, 750 if italic else 700)}
+    builder.setupGlyphOrder(list(glyphs))
+    builder.setupCharacterMap({32: 'space', 65: 'A', 77: 'M'})
+    builder.setupGlyf(glyphs)
+    builder.setupHorizontalMetrics({key: (600, 0) for key in glyphs})
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupNameTable({'familyName': family, 'styleName': style,
+        'uniqueFontIdentifier': family+style, 'fullName': family+' '+style,
+        'psName': family.replace(' ', '')+'-'+style})
+    builder.setupOS2(sTypoAscender=800, sTypoDescender=-200, usWinAscent=800,
+        usWinDescent=200, usWeightClass=700 if bold else 400,
+        fsSelection=(32 if bold else 0) | (1 if italic else 0) | (64 if not bold and not italic else 0))
+    builder.setupPost(italicAngle=-12 if italic else 0, isFixedPitch=1)
+    builder.setupMaxp()
+    builder.font['head'].macStyle = int(bold) | (int(italic) << 1)
+    builder.font['head'].created = builder.font['head'].modified = 3800000000
+    builder.font.recalcTimestamp = False
+    builder.save(root / ('styled-'+style.lower()+'.ttf'))

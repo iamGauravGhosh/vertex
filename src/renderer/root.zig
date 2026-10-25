@@ -4,6 +4,7 @@ const c = @import("c");
 const vt = @import("../terminal/root.zig");
 pub const Atlas = @import("Atlas.zig");
 pub const Damage = @import("Damage.zig");
+pub const Symbols = @import("Symbols.zig");
 const Renderer = @This();
 
 const Colors = @import("../terminal/Colors.zig");
@@ -16,6 +17,9 @@ pub const PositionedGlyph = struct {
     face: usize = 0,
     column: usize,
     end: usize,
+    /// Logical source span remains unchanged when ink borrows an adjacent space.
+    paint_end: ?usize = null,
+    procedural: bool = false,
     /// Fitted bitmap top-left, in 26.6 pixels relative to the row.
     x: i64,
     y: i64,
@@ -23,7 +27,8 @@ pub const PositionedGlyph = struct {
     height: usize = 0,
     style: vt.Style,
 };
-const Face = struct { face: c.FT_Face, font: *c.hb_font_t, index: usize };
+const Face = struct { face: c.FT_Face, font: *c.hb_font_t, index: usize, variant: u2 = 0 };
+pub const FontOptions = struct { family: []const u8 = "monospace", size: f64 = 12, directory: ?[:0]const u8 = null };
 const Row = struct {
     fingerprint: u64 = 0,
     source: u64 = 0,
@@ -40,6 +45,8 @@ library: c.FT_Library,
 face: c.FT_Face,
 font: *c.hb_font_t,
 fallbacks: *c.FcFontSet,
+style_sets: [3]*c.FcFontSet,
+point_size: f64,
 faces: std.ArrayList(Face) = .empty,
 bidi: bool = false,
 buffer: *c.hb_buffer_t,
@@ -54,7 +61,7 @@ shaped_rows: usize = 0,
 hover: ?vt.Links.Range = null,
 levels_scratch: std.ArrayList(c.FriBidiLevel) = .empty,
 scripts_scratch: std.ArrayList(c.hb_script_t) = .empty,
-font_cache: std.AutoHashMapUnmanaged(u21, usize) = .empty,
+font_cache: std.AutoHashMapUnmanaged(u32, usize) = .empty,
 raster_scratch: std.ArrayList(u8) = .empty,
 bidi_chars: std.ArrayList(c.FriBidiChar) = .empty,
 bidi_columns: std.ArrayList(usize) = .empty,
@@ -80,9 +87,16 @@ pub fn initFont(allocator: std.mem.Allocator, name: [:0]const u8) !Renderer {
 
 /// Additional application fonts make rendering tests independent of installed fonts.
 pub fn initFontDirectory(allocator: std.mem.Allocator, name: [:0]const u8, directory: ?[:0]const u8) !Renderer {
+    return initWithOptions(allocator, .{ .family = name, .directory = directory });
+}
+
+pub fn initWithOptions(allocator: std.mem.Allocator, options: FontOptions) !Renderer {
+    if (!std.math.isFinite(options.size) or options.size < 4 or options.size > 128) return error.FontSizeFailed;
+    const name = try allocator.dupeSentinel(u8, if (options.family.len == 0) "monospace" else options.family, 0);
+    defer allocator.free(name);
     const config = c.FcInitLoadConfigAndFonts() orelse return error.FontconfigFailed;
     defer c.FcConfigDestroy(config);
-    if (directory) |path| if (c.FcConfigAppFontAddDir(config, @ptrCast(path)) == 0) return error.FontNotFound;
+    if (options.directory) |path| if (c.FcConfigAppFontAddDir(config, @ptrCast(path)) == 0) return error.FontNotFound;
     const pattern = c.FcNameParse(name.ptr) orelse return error.FontconfigFailed;
     defer c.FcPatternDestroy(pattern);
     _ = c.FcConfigSubstitute(config, pattern, c.FcMatchPattern);
@@ -90,6 +104,19 @@ pub fn initFontDirectory(allocator: std.mem.Allocator, name: [:0]const u8, direc
     var result: c.FcResult = undefined;
     const fallbacks = c.FcFontSort(config, pattern, c.FcTrue, null, &result) orelse return error.FontNotFound;
     errdefer c.FcFontSetDestroy(fallbacks);
+    var style_sets: [3]*c.FcFontSet = undefined;
+    var style_count: usize = 0;
+    errdefer for (style_sets[0..style_count]) |set| c.FcFontSetDestroy(set);
+    for (&style_sets, 1..) |*set, variant| {
+        const styled = c.FcPatternDuplicate(pattern) orelse return error.OutOfMemory;
+        defer c.FcPatternDestroy(styled);
+        _ = c.FcPatternDel(styled, c.FC_WEIGHT);
+        _ = c.FcPatternDel(styled, c.FC_SLANT);
+        _ = c.FcPatternAddInteger(styled, c.FC_WEIGHT, if (variant & 1 != 0) c.FC_WEIGHT_BOLD else c.FC_WEIGHT_REGULAR);
+        _ = c.FcPatternAddInteger(styled, c.FC_SLANT, if (variant & 2 != 0) c.FC_SLANT_ITALIC else c.FC_SLANT_ROMAN);
+        set.* = c.FcFontSort(config, styled, c.FcTrue, null, &result) orelse return error.FontNotFound;
+        style_count += 1;
+    }
     const match = c.FcFontMatch(config, pattern, &result) orelse return error.FontNotFound;
     defer c.FcPatternDestroy(match);
     var filename: [*c]c.FcChar8 = null;
@@ -102,7 +129,7 @@ pub fn initFontDirectory(allocator: std.mem.Allocator, name: [:0]const u8, direc
     _ = c.FcPatternGetInteger(match, c.FC_INDEX, 0, &face_index);
     if (c.FT_New_Face(library, @ptrCast(filename), face_index, &face) != 0) return error.FontLoadFailed;
     errdefer _ = c.FT_Done_Face(face);
-    if (c.FT_Set_Pixel_Sizes(face, 0, 16) != 0) return error.FontSizeFailed;
+    try sizeFace(face, options.size, 1);
     const m = face.*.size.*.metrics;
     const advance = if (c.FT_Get_Char_Index(face, 'M') != 0 and c.FT_Load_Char(face, 'M', c.FT_LOAD_DEFAULT) == 0 and face.*.glyph.*.advance.x > 0) face.*.glyph.*.advance.x else m.max_advance;
     const font = c.hb_ft_font_create_referenced(face) orelse return error.OutOfMemory;
@@ -116,6 +143,8 @@ pub fn initFontDirectory(allocator: std.mem.Allocator, name: [:0]const u8, direc
         .face = face,
         .font = font,
         .fallbacks = fallbacks,
+        .style_sets = style_sets,
+        .point_size = options.size,
         .buffer = buffer,
         .cell_width = @intCast(@max(1, @divTrunc(advance + 63, 64))),
         .cell_height = @intCast(@max(1, @divTrunc(m.height + 63, 64))),
@@ -157,6 +186,7 @@ pub fn deinit(self: *Renderer) void {
     }
     self.faces.deinit(self.allocator);
     c.FcFontSetDestroy(self.fallbacks);
+    for (self.style_sets) |set| c.FcFontSetDestroy(set);
     c.hb_font_destroy(self.font);
     _ = c.FT_Done_Face(self.face);
     _ = c.FT_Done_FreeType(self.library);
@@ -166,10 +196,10 @@ pub fn deinit(self: *Renderer) void {
 pub fn setScale(self: *Renderer, scale: usize) !void {
     if (scale == self.scale) return;
     if (scale == 0 or scale > 1024) return error.FontSizeFailed;
-    if (c.FT_Set_Pixel_Sizes(self.face, 0, @intCast(16 * scale)) != 0) return error.FontSizeFailed;
+    try sizeFace(self.face, self.point_size, scale);
     c.hb_ft_font_changed(self.font);
     for (self.faces.items) |face| {
-        try sizeFace(face.face, 16 * scale);
+        try sizeFace(face.face, self.point_size, scale);
         c.hb_ft_font_changed(face.font);
     }
     self.atlas.clear();
@@ -178,8 +208,13 @@ pub fn setScale(self: *Renderer, scale: usize) !void {
     self.scale = scale;
 }
 
-fn sizeFace(face: c.FT_Face, pixels: usize) !void {
-    if (c.FT_Set_Pixel_Sizes(face, 0, @intCast(pixels)) == 0) return;
+fn pixelSize(self: *const Renderer) usize {
+    return @intFromFloat(@round(self.point_size * 96.0 / 72.0 * @as(f64, @floatFromInt(self.scale))));
+}
+
+fn sizeFace(face: c.FT_Face, points: f64, scale: usize) !void {
+    const pixels: usize = @intFromFloat(@round(points * 96.0 / 72.0 * @as(f64, @floatFromInt(scale))));
+    if (c.FT_Set_Char_Size(face, 0, @intFromFloat(@round(points * 64)), @intCast(96 * scale), @intCast(96 * scale)) == 0) return;
     if (face.*.num_fixed_sizes == 0) return error.FontSizeFailed;
     var best: c_int = 0;
     for (0..@intCast(face.*.num_fixed_sizes)) |i| {
@@ -187,94 +222,82 @@ fn sizeFace(face: c.FT_Face, pixels: usize) !void {
     }
     if (c.FT_Select_Size(face, best) != 0) return error.FontSizeFailed;
 }
+fn ignorable(cp: u21) bool {
+    return vt.Unicode.isFormat(cp) or cp == 0x200c or cp == 0x200d or
+        (cp >= 0xfe00 and cp <= 0xfe0f) or (cp >= 0xe0020 and cp <= 0xe007f) or
+        (cp >= 0xe0100 and cp <= 0xe01ef);
+}
 fn supports(face: c.FT_Face, cluster: []const u21) bool {
     for (cluster) |cp| {
-        if (cp == 0x200d or cp == 0x200c or (cp >= 0xfe00 and cp <= 0xfe0f) or (cp >= 0xe0020 and cp <= 0xe007f)) continue;
+        if (ignorable(cp)) continue;
         if (c.FT_Get_Char_Index(face, cp) == 0) return false;
     }
     return true;
 }
-fn faceFor(self: *Renderer, cluster: []const u21) !usize {
-    if (cluster.len != 1) return self.findFace(cluster);
-    if (self.font_cache.get(cluster[0])) |face| return face;
-    const face = try self.findFace(cluster);
+fn faceFor(self: *Renderer, cluster: []const u21, style: vt.Style) !usize {
+    const variant: u2 = @as(u2, @intFromBool(style.bold)) | (@as(u2, @intFromBool(style.italic)) << 1);
+    if (cluster.len != 1) return self.findFace(cluster, variant);
+    const key = @as(u32, cluster[0]) | (@as(u32, variant) << 21);
+    if (self.font_cache.get(key)) |face| return face;
+    const face = try self.findFace(cluster, variant);
     if (self.font_cache.count() >= 4096) self.font_cache.clearRetainingCapacity();
-    try self.font_cache.put(self.allocator, cluster[0], face);
+    try self.font_cache.put(self.allocator, key, face);
     return face;
 }
-fn findFace(self: *Renderer, cluster: []const u21) !usize {
+fn findFace(self: *Renderer, cluster: []const u21, variant: u2) !usize {
     var emoji = false;
-    for (cluster) |cp| if (cp == 0xfe0f or vt.Unicode.isEmojiPresentation(cp)) {
-        emoji = true;
-    };
-    if (!emoji and supports(self.face, cluster)) return 0;
-    for (self.faces.items, 0..) |face, i| if (supports(face.face, cluster) and (!emoji or face.face.*.face_flags & c.FT_FACE_FLAG_COLOR != 0)) return i + 1;
-    for (0..@intCast(self.fallbacks.nfont)) |i| {
-        const pattern = self.fallbacks.fonts[i];
-        var charset: ?*c.FcCharSet = null;
-        if (c.FcPatternGetCharSet(pattern, c.FC_CHARSET, 0, &charset) != c.FcResultMatch) continue;
-        var supported = true;
-        for (cluster) |cp| {
-            if (cp == 0x200d or cp == 0x200c or (cp >= 0xfe00 and cp <= 0xfe0f) or (cp >= 0xe0020 and cp <= 0xe007f)) continue;
-            if (c.FcCharSetHasChar(charset, cp) == 0) {
-                supported = false;
-                break;
-            }
-        }
-        if (!supported) continue;
-        if (emoji) {
-            var is_color: c.FcBool = 0;
-            if (c.FcPatternGetBool(pattern, c.FC_COLOR, 0, &is_color) != c.FcResultMatch or is_color == 0) continue;
-        }
-        for (self.faces.items, 0..) |face, j| if (face.index == i) return j + 1;
-        var filename: [*c]c.FcChar8 = null;
-        var index: c_int = 0;
-        if (c.FcPatternGetString(pattern, c.FC_FILE, 0, &filename) != c.FcResultMatch) continue;
-        _ = c.FcPatternGetInteger(pattern, c.FC_INDEX, 0, &index);
-        var face: c.FT_Face = null;
-        if (c.FT_New_Face(self.library, @ptrCast(filename), index, &face) != 0) continue;
-        errdefer _ = c.FT_Done_Face(face);
-        sizeFace(face, 16 * self.scale) catch {
-            _ = c.FT_Done_Face(face);
-            continue;
-        };
-        const font = c.hb_ft_font_create_referenced(face) orelse return error.OutOfMemory;
-        errdefer c.hb_font_destroy(font);
-        try self.faces.append(self.allocator, .{ .face = face, .font = font, .index = i });
-        return self.faces.items.len;
+    var text = false;
+    for (cluster) |cp| {
+        if (cp == 0xfe0e) text = true;
+        if (cp == 0xfe0f or vt.Unicode.isEmojiPresentation(cp)) emoji = true;
     }
-    // A monochrome glyph is preferable to a replacement when no color face exists.
-    if (supports(self.face, cluster)) return 0;
-    for (self.faces.items, 0..) |face, i| if (supports(face.face, cluster)) return i + 1;
-    if (emoji) {
-        // Retry Fontconfig without the color preference.
-        // The general search below does not apply a color requirement.
-        for (0..@intCast(self.fallbacks.nfont)) |i| {
+    emoji = emoji and !text;
+    const set = if (variant == 0) self.fallbacks else self.style_sets[variant - 1];
+    // Always follow Fontconfig order, independent of faces loaded by earlier rows.
+    for (0..(if (emoji) @as(usize, 2) else 1)) |pass| {
+        const prefer_color = emoji and pass == 0;
+        if (variant == 0 and !prefer_color and supports(self.face, cluster)) return 0;
+        for (0..@intCast(set.nfont)) |i| {
+            const pattern = set.fonts[i];
             var charset: ?*c.FcCharSet = null;
-            if (c.FcPatternGetCharSet(self.fallbacks.fonts[i], c.FC_CHARSET, 0, &charset) != c.FcResultMatch) continue;
-            var ok = true;
-            for (cluster) |cp| if (cp != 0xfe0f and cp != 0xfe0e and cp != 0x200d and c.FcCharSetHasChar(charset, cp) == 0) {
-                ok = false;
-                break;
-            };
-            if (!ok) continue;
+            if (c.FcPatternGetCharSet(pattern, c.FC_CHARSET, 0, &charset) != c.FcResultMatch) continue;
+            var supported = true;
+            for (cluster) |cp| {
+                if (ignorable(cp)) continue;
+                if (c.FcCharSetHasChar(charset, cp) == 0) {
+                    supported = false;
+                    break;
+                }
+            }
+            if (!supported) continue;
+            if (prefer_color) {
+                var is_color: c.FcBool = 0;
+                if (c.FcPatternGetBool(pattern, c.FC_COLOR, 0, &is_color) != c.FcResultMatch or is_color == 0) continue;
+            }
+            for (self.faces.items, 0..) |face, j| if (face.index == i and face.variant == variant and supports(face.face, cluster)) return j + 1;
             var filename: [*c]c.FcChar8 = null;
             var index: c_int = 0;
-            _ = c.FcPatternGetInteger(self.fallbacks.fonts[i], c.FC_INDEX, 0, &index);
-            if (c.FcPatternGetString(self.fallbacks.fonts[i], c.FC_FILE, 0, &filename) != c.FcResultMatch) continue;
+            if (c.FcPatternGetString(pattern, c.FC_FILE, 0, &filename) != c.FcResultMatch) continue;
+            _ = c.FcPatternGetInteger(pattern, c.FC_INDEX, 0, &index);
             var face: c.FT_Face = null;
             if (c.FT_New_Face(self.library, @ptrCast(filename), index, &face) != 0) continue;
             errdefer _ = c.FT_Done_Face(face);
-            sizeFace(face, 16 * self.scale) catch {
+            sizeFace(face, self.point_size, self.scale) catch {
                 _ = c.FT_Done_Face(face);
                 continue;
             };
+            if (!supports(face, cluster)) {
+                _ = c.FT_Done_Face(face);
+                continue;
+            }
             const font = c.hb_ft_font_create_referenced(face) orelse return error.OutOfMemory;
             errdefer c.hb_font_destroy(font);
-            try self.faces.append(self.allocator, .{ .face = face, .font = font, .index = i });
+            try self.faces.append(self.allocator, .{ .face = face, .font = font, .index = i, .variant = variant });
             return self.faces.items.len;
         }
     }
+    // Resolve a visible replacement through the same style-aware fallback order.
+    if (!(cluster.len == 1 and cluster[0] == 0xfffd)) return self.findFace(&.{0xfffd}, variant);
     return 0;
 }
 fn fontFace(self: *Renderer, index: usize) Face {
@@ -393,8 +416,23 @@ pub fn shapeRow(self: *Renderer, screen: *const vt.Screen, index: usize) ![]cons
             start += 1;
             continue;
         }
+        if (Symbols.supports(cells[start].codepoint) and screen.getGrapheme(index, start).?.len == 1) {
+            try row.glyphs.append(self.allocator, .{
+                .id = cells[start].codepoint,
+                .column = start,
+                .end = start + cells[start].width,
+                .procedural = true,
+                .x = @intCast(row.visual.items[start] * self.cell_width * self.scale * 64),
+                .y = 0,
+                .width = self.cell_width * self.scale,
+                .height = self.cell_height * self.scale,
+                .style = cells[start].style,
+            });
+            start += cells[start].width;
+            continue;
+        }
         const script = scripts[start];
-        const face_index = try self.faceFor(screen.getGrapheme(index, start).?);
+        const face_index = try self.faceFor(screen.getGrapheme(index, start).?, cells[start].style);
         const selected = self.fontFace(face_index);
         const rtl = @mod(levels[start], 2) == 1;
         var end = start + cells[start].width;
@@ -403,7 +441,7 @@ pub fn shapeRow(self: *Renderer, screen: *const vt.Screen, index: usize) ![]cons
                 end += 1;
                 continue;
             }
-            if (privateUse(cells[start].codepoint) or privateUse(cells[end].codepoint) or !std.meta.eql(cells[end].style, cells[start].style) or scripts[end] != script or @mod(levels[end], 2) != @mod(levels[start], 2) or try self.faceFor(screen.getGrapheme(index, end).?) != face_index) break;
+            if (Symbols.supports(cells[end].codepoint) or privateUse(cells[start].codepoint) or privateUse(cells[end].codepoint) or !std.meta.eql(cells[end].style, cells[start].style) or scripts[end] != script or @mod(levels[end], 2) != @mod(levels[start], 2) or try self.faceFor(screen.getGrapheme(index, end).?, cells[end].style) != face_index) break;
             end += cells[end].width;
         }
         c.hb_buffer_reset(self.buffer);
@@ -415,7 +453,7 @@ pub fn shapeRow(self: *Renderer, screen: *const vt.Screen, index: usize) ![]cons
         for (start..end) |column| {
             if (cells[column].width == 0) continue;
             for (screen.getGrapheme(index, column).?) |cp| {
-                const replacement: u32 = if (c.FT_Get_Char_Index(selected.face, cp) == 0 and vt.Unicode.scalarWidth(cp) != 0 and !(cp >= 0x200b and cp <= 0x200f) and !(cp >= 0x202a and cp <= 0x202e) and !(cp >= 0x2060 and cp <= 0x206f)) 0xfffd else cp;
+                const replacement: u32 = if (c.FT_Get_Char_Index(selected.face, cp) == 0 and vt.Unicode.scalarWidth(cp) != 0 and !ignorable(cp)) 0xfffd else cp;
                 c.hb_buffer_add(self.buffer, replacement, @intCast(column));
             }
         }
@@ -434,7 +472,7 @@ pub fn shapeRow(self: *Renderer, screen: *const vt.Screen, index: usize) ![]cons
             for (column..@max(column + cells[column].width, cluster_end)) |col| visual = @min(visual, row.visual.items[col]);
             var pen: i64 = 0;
             const first_glyph = row.glyphs.items.len;
-            const numerator: i64 = if (selected.face.*.face_flags & c.FT_FACE_FLAG_SCALABLE == 0) @intCast(16 * self.scale) else 1;
+            const numerator: i64 = if (selected.face.*.face_flags & c.FT_FACE_FLAG_SCALABLE == 0) @intCast(self.pixelSize()) else 1;
             const denominator: i64 = if (numerator != 1) @max(1, selected.face.*.size.*.metrics.y_ppem) else 1;
             for (i..next) |j| {
                 try row.glyphs.append(self.allocator, .{
@@ -448,7 +486,19 @@ pub fn shapeRow(self: *Renderer, screen: *const vt.Screen, index: usize) ![]cons
                 });
                 pen += @divTrunc(@as(i64, positions[j].x_advance) * numerator, denominator);
             }
-            try self.fitCluster(row.glyphs.items[first_glyph..], visual, pen, privateUse(cells[column].codepoint));
+            const icon = privateUse(cells[column].codepoint);
+            const logical_end = row.glyphs.items[first_glyph].end;
+            var paint_end = logical_end;
+            if (icon and try self.iconWantsSpace(row.glyphs.items[first_glyph..]) and logical_end == column + 1 and logical_end < cells.len and
+                cells[logical_end].codepoint == ' ' and cells[logical_end].width == 1 and
+                screen.getGrapheme(index, logical_end).?.len == 1 and
+                std.meta.eql(cells[column].style, cells[logical_end].style) and cells[column].link == cells[logical_end].link and
+                row.visual.items[logical_end] == visual + 1)
+            {
+                paint_end += 1;
+            }
+            for (row.glyphs.items[first_glyph..]) |*glyph| glyph.paint_end = paint_end;
+            try self.fitCluster(row.glyphs.items[first_glyph..], visual, pen, icon);
             i = next;
         }
         start = end;
@@ -482,7 +532,7 @@ fn privateUse(cp: u21) bool {
 }
 
 fn glyphKey(g: PositionedGlyph) u64 {
-    return (@as(u64, @intCast(g.face)) << 40) | @as(u64, g.id) | (@as(u64, @intFromBool(g.style.bold)) << 32) | (@as(u64, @intFromBool(g.style.italic)) << 33);
+    return (@as(u64, @intFromBool(g.procedural)) << 63) | (@as(u64, @intCast(g.face)) << 40) | @as(u64, g.id) | (@as(u64, @intFromBool(g.style.bold)) << 32) | (@as(u64, @intFromBool(g.style.italic)) << 33);
 }
 
 fn glyphMetrics(self: *Renderer, g: PositionedGlyph) !Metrics {
@@ -492,6 +542,28 @@ fn glyphMetrics(self: *Renderer, g: PositionedGlyph) !Metrics {
     if (self.metrics.count() >= 4096) self.metrics.clearRetainingCapacity();
     try self.metrics.put(key, m);
     return m;
+}
+
+/// Borrow space only when the ink would otherwise be compressed horizontally.
+fn iconWantsSpace(self: *Renderer, glyphs: []const PositionedGlyph) !bool {
+    var left: i64 = std.math.maxInt(i64);
+    var right: i64 = std.math.minInt(i64);
+    var top: i64 = std.math.maxInt(i64);
+    var bottom: i64 = std.math.minInt(i64);
+    for (glyphs) |g| {
+        const m = try self.glyphMetrics(g);
+        if (m.width == 0 or m.height == 0) continue;
+        const x = @divFloor(g.x, 64) + m.left;
+        const y = @divFloor(g.y, 64) - m.top;
+        left = @min(left, x);
+        right = @max(right, x + @as(i64, @intCast(m.width)));
+        top = @min(top, y);
+        bottom = @max(bottom, y + @as(i64, @intCast(m.height)));
+    }
+    if (left == std.math.maxInt(i64)) return false;
+    const cw: i64 = @intCast(self.cell_width * self.scale);
+    const ch: i64 = @intCast(self.cell_height * self.scale);
+    return right - left > cw and (right - left) * ch > cw * (bottom - top);
 }
 
 /// Transform a complete HB cluster together, retaining mark and ligature geometry.
@@ -515,7 +587,7 @@ fn fitCluster(self: *Renderer, glyphs: []PositionedGlyph, visual: usize, advance
     }
     if (left == std.math.maxInt(i64)) return;
     const first = glyphs[0];
-    const width: i64 = @intCast((first.end - first.column) * self.cell_width * self.scale);
+    const width: i64 = @intCast(((first.paint_end orelse first.end) - first.column) * self.cell_width * self.scale);
     const height: i64 = @intCast(self.cell_height * self.scale);
     if (!icon) {
         left = @min(0, left);
@@ -527,14 +599,15 @@ fn fitCluster(self: *Renderer, glyphs: []PositionedGlyph, visual: usize, advance
         numerator = width;
         denominator = right - left;
     }
-    if (icon and (bottom - top) * numerator > height * denominator) {
+    if ((bottom - top) * numerator > height * denominator) {
         numerator = height;
         denominator = bottom - top;
     }
     const proportional = self.fontFace(first.face).face.*.face_flags & c.FT_FACE_FLAG_FIXED_WIDTH == 0;
     const padding_x = if (icon or proportional or numerator != denominator) @divFloor(width - @divFloor((right - left) * numerator, denominator), 2) else 0;
     const origin_x: i64 = @as(i64, @intCast(visual * self.cell_width * self.scale)) + padding_x;
-    const origin_y: i64 = if (icon) @divFloor(height - @divFloor((bottom - top) * numerator, denominator), 2) else self.ascent * @as(i64, @intCast(self.scale));
+    const ascent: i64 = self.ascent * @as(i64, @intCast(self.scale));
+    const origin_y: i64 = if (icon) @divFloor(height - @divFloor((bottom - top) * numerator, denominator), 2) else std.math.clamp(ascent, -@divFloor(top * numerator, denominator), height - @divFloor(bottom * numerator, denominator));
     for (glyphs) |*g| {
         const x = @divFloor((g.x - left) * numerator, denominator);
         const y = @divFloor((g.y - (if (icon) top else @as(i64, 0))) * numerator, denominator);
@@ -552,15 +625,15 @@ fn load(self: *Renderer, face_index: usize, id: u32, style: vt.Style) !Metrics {
         if (c.FT_Load_Glyph(face, id, c.FT_LOAD_DEFAULT | c.FT_LOAD_NO_SVG) != 0) return error.GlyphLoadFailed;
     }
     const slot = face.*.glyph;
-    if (style.bold and slot.*.format != c.FT_GLYPH_FORMAT_BITMAP) c.FT_GlyphSlot_Embolden(slot);
-    if (style.italic and slot.*.format != c.FT_GLYPH_FORMAT_BITMAP) c.FT_GlyphSlot_Oblique(slot);
+    if (style.bold and face.*.style_flags & c.FT_STYLE_FLAG_BOLD == 0 and slot.*.format != c.FT_GLYPH_FORMAT_BITMAP) c.FT_GlyphSlot_Embolden(slot);
+    if (style.italic and face.*.style_flags & c.FT_STYLE_FLAG_ITALIC == 0 and slot.*.format != c.FT_GLYPH_FORMAT_BITMAP) c.FT_GlyphSlot_Oblique(slot);
     if (c.FT_Render_Glyph(slot, c.FT_RENDER_MODE_NORMAL) != 0) {
         // Unsupported color formats may still have a usable monochrome outline.
         if (c.FT_Load_Glyph(face, id, c.FT_LOAD_DEFAULT | c.FT_LOAD_NO_SVG) != 0 or c.FT_Render_Glyph(slot, c.FT_RENDER_MODE_NORMAL) != 0) {
             if (c.FT_Load_Char(face, 0xfffd, c.FT_LOAD_RENDER | c.FT_LOAD_NO_SVG) != 0) return .{ .width = 0, .height = 0, .left = 0, .top = 0 };
         }
     }
-    const numerator: usize = if (face.*.face_flags & c.FT_FACE_FLAG_SCALABLE == 0) 16 * self.scale else 1;
+    const numerator: usize = if (face.*.face_flags & c.FT_FACE_FLAG_SCALABLE == 0) self.pixelSize() else 1;
     const denominator: usize = if (numerator != 1) @max(1, face.*.size.*.metrics.y_ppem) else 1;
     return .{ .width = (slot.*.bitmap.width * numerator + denominator - 1) / denominator, .height = (slot.*.bitmap.rows * numerator + denominator - 1) / denominator, .left = @intCast(@divTrunc(@as(i64, slot.*.bitmap_left) * @as(i64, @intCast(numerator)), @as(i64, @intCast(denominator)))), .top = @intCast(@divTrunc(@as(i64, slot.*.bitmap_top) * @as(i64, @intCast(numerator)), @as(i64, @intCast(denominator)))) };
 }
@@ -609,7 +682,7 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
                 while (tx < g.width) : (tx += Atlas.tile_size) {
                     const tile_key: Atlas.Key = .{ .glyph = key, .width = @intCast(g.width), .height = @intCast(g.height), .x = @intCast(tx), .y = @intCast(ty) };
                     const region = self.atlas.get(tile_key) orelse blk: {
-                        if (!loaded) {
+                        if (!loaded and !g.procedural) {
                             _ = try self.load(g.face, g.id, g.style);
                             loaded = true;
                         }
@@ -617,13 +690,13 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
                         const tw: usize = @min(Atlas.tile_size, g.width - tx);
                         const th: usize = @min(Atlas.tile_size, g.height - ty);
                         // Only a bounded tile scratch buffer, including for very large glyphs.
-                        const is_color = bitmap.pixel_mode == c.FT_PIXEL_MODE_BGRA;
+                        const is_color = !g.procedural and bitmap.pixel_mode == c.FT_PIXEL_MODE_BGRA;
                         const channels: usize = if (is_color) 4 else 1;
                         try self.raster_scratch.resize(self.allocator, tw * th * channels);
                         const scratch = self.raster_scratch.items;
                         for (0..th) |by| {
                             for (0..tw) |bx| {
-                                const texel = try rasterPixel(bitmap, tx + bx, ty + by, g.width, g.height);
+                                const texel: [4]u8 = if (g.procedural) @splat(Symbols.alpha(@intCast(g.id), tx + bx, ty + by, g.width, g.height)) else try rasterPixel(bitmap, tx + bx, ty + by, g.width, g.height);
                                 if (is_color) {
                                     const target = scratch[(by * tw + bx) * 4 ..][0..4];
                                     target.* = texel;
@@ -640,7 +713,7 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
                     const dx: i32 = @intCast(@divFloor(g.x, 64) + @as(i64, @intCast(tx)));
                     const dy: i32 = @intCast(y + @divFloor(g.y, 64) + @as(i64, @intCast(ty)));
                     // Per-cell clips preserve cursor colors even inside a single ligature.
-                    for (g.column..g.end) |col| {
+                    for (g.column..g.paint_end orelse g.end) |col| {
                         const rgb = colors(g.style, cursor.visible and cursor.shape == .block and cursor.row == row and cursor.column == col);
                         try painter.mask(&self.atlas, region, dx, dy, .{ .x = @intCast(self.visualCached(screen, row, col) * cw), .y = y, .width = @intCast(cw), .height = @intCast(ch) }, rgb.fg);
                     }

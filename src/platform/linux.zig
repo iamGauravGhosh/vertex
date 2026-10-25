@@ -11,6 +11,7 @@ const Clipboard = @import("Clipboard.zig");
 const Ime = @import("Ime.zig");
 const Desktop = @import("Desktop.zig");
 const ImageDecoder = @import("ImageDecoder.zig");
+const FontConfig = @import("FontConfig.zig");
 
 const Output = struct { app: *App, name: u32, object: *c.wl_output, scale: usize = 1, entered: bool = false };
 const Buffer = struct {
@@ -50,12 +51,16 @@ pub fn run(allocator: std.mem.Allocator, command: []const []const u8) !u8 {
         std.debug.print("vertex: VERTEX_RENDERER must be auto, gpu, or cpu\n", .{});
         return error.InvalidRenderer;
     };
-    const font_name = c.getenv("VERTEX_FONT");
+    const font_config = FontConfig.load(allocator) catch |err| {
+        std.debug.print("vertex: font config: {s} (font_family and font_size, 4–128 pt)\n", .{@errorName(err)});
+        return err;
+    };
+    defer allocator.free(font_config.font_family);
     var app: App = .{
         .allocator = allocator,
         .clipboard = .{ .allocator = allocator },
         .ime = .{ .allocator = allocator },
-        .renderer = try Renderer.initConfigured(allocator, if (font_name != null) std.mem.span(font_name) else null),
+        .renderer = try Renderer.initWithOptions(allocator, .{ .family = font_config.font_family, .size = font_config.font_size }),
         .screen = undefined,
         .session = undefined,
         .mode = mode,

@@ -11,6 +11,7 @@ const linux = @import("platform/linux.zig");
 
 test {
     _ = linux;
+    _ = @import("font_tests.zig");
     _ = @import("performance_tests.zig");
 }
 
@@ -354,7 +355,7 @@ test "optional installed font renders text and Nerd symbols on the terminal grid
     var screen = try vt.Screen.init(t.allocator, 2, 12);
     defer screen.deinit();
     var parser = vt.Parser.init();
-    parser.feed("iW\u{e0b0}\u{f0001}\u{f013}ii A\u{301}\r\nאבA😀\x1b[?25l", &screen);
+    parser.feed("iW\u{e700}\u{f0001}\u{f013}ii A\u{301}\r\nאבA😀\x1b[?25l", &screen);
     for ([_]usize{ 1, 2 }) |scale| {
         try renderer.setScale(scale);
         const width = screen.columns * renderer.cell_width * scale;
@@ -371,9 +372,9 @@ test "optional installed font renders text and Nerd symbols on the terminal grid
 fn expectGlyphColumns(renderer: *Renderer, screen: *const vt.Screen, row: usize, glyph: Renderer.PositionedGlyph) !void {
     if (glyph.width == 0 or glyph.height == 0) return;
     var visual = screen.columns;
-    for (glyph.column..glyph.end) |column| visual = @min(visual, try renderer.visualColumn(screen, row, column));
+    for (glyph.column..glyph.paint_end orelse glyph.end) |column| visual = @min(visual, try renderer.visualColumn(screen, row, column));
     const left: i64 = @intCast(visual * renderer.cell_width * renderer.scale);
-    const right: i64 = left + @as(i64, @intCast((glyph.end - glyph.column) * renderer.cell_width * renderer.scale));
+    const right: i64 = left + @as(i64, @intCast(((glyph.paint_end orelse glyph.end) - glyph.column) * renderer.cell_width * renderer.scale));
     try t.expect(@divFloor(glyph.x, 64) >= left);
     try t.expect(@divFloor(glyph.x, 64) + @as(i64, @intCast(glyph.width)) <= right);
 }
@@ -384,7 +385,7 @@ test "proportional glyphs fit cells while ligatures combining marks and wide cel
     var screen = try vt.Screen.init(t.allocator, 1, 10);
     defer screen.deinit();
     var parser = vt.Parser.init();
-    parser.feed("iWOA\u{301}ii界A\u{e0b0}\x1b[?25l", &screen);
+    parser.feed("iWOA\u{301}ii界A\u{e700}\x1b[?25l", &screen);
     for ([_]usize{ 1, 2 }) |scale| {
         try renderer.setScale(scale);
         const glyphs = try renderer.shapeRow(&screen, 0);
@@ -426,7 +427,7 @@ test "Nerd icons retain all four outline edges and never prefer loaded color fon
     defer screen.deinit();
     var parser = vt.Parser.init();
     // The ligature primes the atlas with the same glyph at a different size.
-    parser.feed("😀ii\u{e0b0}A\u{f0001}A\u{100001}\x1b[?25l", &screen);
+    parser.feed("😀ii\u{e700}A\u{f0001}A\u{100001}\x1b[?25l", &screen);
     for ([_]usize{ 1, 2 }) |scale| {
         try renderer.setScale(scale);
         const width = screen.columns * renderer.cell_width * scale;
@@ -461,7 +462,7 @@ test "Nerd symbols fall back from a monospace face without changing terminal adv
     var screen = try vt.Screen.init(t.allocator, 1, 5);
     defer screen.deinit();
     var parser = vt.Parser.init();
-    parser.feed("A\u{e0b0}A\u{f0001}", &screen);
+    parser.feed("A\u{e700}A\u{f0001}", &screen);
     try t.expectEqual(@as(usize, 4), screen.cursor.column);
     for (try renderer.shapeRow(&screen, 0)) |g| {
         if (g.column == 1 or g.column == 3) {
@@ -483,7 +484,7 @@ test "fitted glyph sizes match CPU GPU and incremental redraws across styles bid
     var screen = try vt.Screen.init(t.allocator, 2, 12);
     defer screen.deinit();
     var parser = vt.Parser.init();
-    parser.feed("ii\u{e0b0}iW\u{f0001}A\u{301}\r\nאבA\u{e0b0}\x1b[?25l", &screen);
+    parser.feed("ii\u{e700}iW\u{f0001}A\u{301}\r\nאבA\u{e700}\x1b[?25l", &screen);
     const width = screen.columns * renderer.cell_width * 2;
     const height = screen.rows * renderer.cell_height * 2;
     const pixels = try t.allocator.alloc(u32, width * height);
@@ -499,7 +500,7 @@ test "fitted glyph sizes match CPU GPU and incremental redraws across styles bid
     var damage = Renderer.Damage.init(t.allocator);
     defer damage.deinit();
     for ([_][]const u8{
-        "", "\x1b[1;3H\x1b[1;3m\u{e0b0}\x1b[0m", "\x1b[1;2H\x1b[?25h", "\x1b[?25l", "\x1b[2;1HA\u{301}", "\x1b[1;1HWO",
+        "", "\x1b[1;3H\x1b[1;3m\u{e700}\x1b[0m", "\x1b[1;2H\x1b[?25h", "\x1b[?25l", "\x1b[2;1HA\u{301}", "\x1b[1;1HWO",
     }, 0..) |edit, step| {
         if (step == 3) {
             renderer.atlas.clear();

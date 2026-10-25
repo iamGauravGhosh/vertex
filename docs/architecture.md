@@ -46,8 +46,12 @@ latch them for retrieval after a feed. See [the parser guide](vt-parser.md) for 
 Each row caches shaped glyph IDs, font identity, positions, source cell spans,
 and a content fingerprint. Unicode 15.1 graphemes occupy one or two columns;
 continuation cells are never shaped independently. Fontconfig supplies fallback
-faces for complete clusters. The GUI injects `VERTEX_FONT` at startup, defaulting
-to `monospace`; explicit renderer initializers ignore the environment. Monospace
+faces for complete clusters in stable Fontconfig order, with separate sorted sets
+for regular, bold, italic, and bold-italic styles. The GUI loads font settings
+from the Vertex config and applies environment overrides at startup. Explicit
+renderer initializers ignore configuration and the environment; `initWithOptions`
+accepts a family, point size, and optional fixture directory. The default is
+`monospace` at 12 pt, sized at 96 logical DPI with FreeType. Monospace
 and proportional faces both use the primary font's `M` advance for cell width,
 with a positive metrics fallback when `M` is unavailable. HarfBuzz shapes
 script/style/font/direction runs. Private-use icons form separate runs and do not
@@ -57,7 +61,12 @@ Raster ink bounds and advances determine fitting for each complete shaped
 cluster. Proportional clusters are centered in their assigned columns, and
 overflowing clusters shrink uniformly while preserving mark offsets and ordinary
 text baselines. Private-use icons fit both cell dimensions and are centered
-vertically. Fitted bitmap dimensions and positions are cached in the row; Unicode
+vertically; genuinely wide icons can borrow one immediately adjacent visual space
+with identical style and hyperlink. `PositionedGlyph.end` retains the logical
+span, while `paint_end` records the expanded clip span. Row generations account
+for adjacent-space edits. Box drawing, block elements, Braille, and basic Powerline
+separators bypass fonts and use shared, cell-aligned atlas masks. Fitted bitmap
+dimensions and positions are cached in the row; Unicode
 column widths and input coordinate mapping remain independent of font advances.
 `VERTEX_BIDI=auto` uses FriBidi to resolve soft-wrapped logical paragraphs, then
 reorders each physical row while retaining logical-to-visual column mappings.
