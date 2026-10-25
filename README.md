@@ -44,6 +44,9 @@ URLs opened through Ctrl+click. See [hyperlinks and images](docs/media.md).
 
 ## Requirements
 
+For step-by-step installation, app launcher setup, and Hyprland integration, see
+the [Arch Linux installation guide](docs/install-arch-linux.md).
+
 - Zig 0.17.0.
 - Linux with a Wayland compositor for the GUI.
 - `pkg-config`, `wayland-scanner`, `wayland-protocols`, and development libraries
