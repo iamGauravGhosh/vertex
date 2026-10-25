@@ -6,7 +6,8 @@ rectangles and frames:
 - `color.ttf`: a two-color COLRv0 glyph at U+1F600 and U+F0001, deliberately
   competing with monochrome supplementary private-use icons.
 - `proportional.ttf`: narrow/wide letters, a negative bearing, a combining mark
-  with GPOS attachment, Hebrew, and a wide frame shared by an `ii` ligature and
+  with GPOS attachment, Hebrew, and a wide frame shared by `ii` (`liga`) and
+  `WW` (`calt`) ligatures and
   icons at U+E0B0, U+F0001, and U+100001.
 - `icons.ttf`: the same private-use frames without `M` or ordinary text, testing
   fallback selection and symbol-only cell metrics.

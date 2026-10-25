@@ -15,6 +15,11 @@ pub fn poll(self: *Desktop) void {
 }
 pub fn open(self: *Desktop, allocator: std.mem.Allocator, uri: []const u8) !void {
     if (!Links.allowed(uri)) return error.InvalidUri;
+    return self.launch(allocator, &.{ "xdg-open", uri });
+}
+/// Explicit argv only: bindings never run through an implicit shell.
+pub fn launch(self: *Desktop, allocator: std.mem.Allocator, arguments: []const []const u8) !void {
+    if (arguments.len == 0 or arguments[0].len == 0) return error.InvalidCommand;
     self.poll();
     var available: ?*c.pid_t = null;
     for (&self.children) |*pid| if (pid.* == 0) {
@@ -22,15 +27,17 @@ pub fn open(self: *Desktop, allocator: std.mem.Allocator, uri: []const u8) !void
         break;
     };
     const slot = available orelse return error.TooManyOpeners;
-    const target = try allocator.dupeSentinel(u8, uri, 0);
-    defer allocator.free(target);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const argv = try arena.allocator().alloc(?[*:0]const u8, arguments.len + 1);
+    for (arguments, 0..) |argument, i| argv[i] = (try arena.allocator().dupeSentinel(u8, argument, 0)).ptr;
+    argv[arguments.len] = null;
     const pid = c.fork();
     if (pid < 0) return error.OpenerFailed;
     if (pid == 0) {
         _ = c.setsid();
         _ = c.signal(c.SIGPIPE, c.SIG_DFL);
-        const argv = [_]?[*:0]const u8{ "xdg-open", target, null };
-        _ = c.execvp("xdg-open", @ptrCast(@constCast(&argv)));
+        _ = c.execvp(argv[0].?, @ptrCast(argv.ptr));
         c._exit(127);
     }
     slot.* = pid;

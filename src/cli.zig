@@ -3,10 +3,15 @@ const terminal = @import("terminal/root.zig");
 const trace = @import("terminal/trace.zig");
 
 const usage =
-    \\Usage: vertex [parse [--stream-strings] | -- command [args...] | --help]
+    \\Usage: vertex [--config PATH] [-- command [args...]]
+    \\       vertex config check [--config PATH] | config defaults
+    \\       vertex parse [--stream-strings] | --help
     \\
     \\  (no arguments)  Open a Wayland terminal running your interactive shell.
     \\  -- command      Run a command in the terminal instead of your shell.
+    \\  --config PATH   Load a specific TOML configuration.
+    \\  config check    Validate configuration without opening a window.
+    \\  config defaults Print the default TOML configuration.
     \\  parse       Read VT bytes from stdin and write an escaped event trace.
     \\  --stream-strings  Trace OSC and APC incrementally (after parse).
     \\  --help, -h  Show this help.
@@ -23,6 +28,10 @@ pub fn run(
     diagnostic: *std.Io.Writer,
 ) !u8 {
     if (opensWindow(args)) return error.WindowRequired;
+    if (args.len == 2 and std.mem.eql(u8, args[0], "config") and std.mem.eql(u8, args[1], "defaults")) {
+        try output.writeAll(@embedFile("config_defaults.toml"));
+        return 0;
+    }
     if ((args.len == 1 and isHelp(args[0])) or
         (args.len == 2 and std.mem.eql(u8, args[0], "parse") and isHelp(args[1])))
     {
@@ -63,7 +72,22 @@ pub fn run(
 
 /// Keep launch selection independent of windowing and injected stream I/O.
 pub fn opensWindow(args: []const []const u8) bool {
-    return args.len == 0 or (args.len > 1 and std.mem.eql(u8, args[0], "--"));
+    return args.len == 0 or (args.len > 1 and std.mem.eql(u8, args[0], "--")) or (args.len >= 2 and std.mem.eql(u8, args[0], "--config"));
+}
+
+pub const Launch = struct { config: ?[]const u8 = null, command: []const []const u8 = &.{} };
+pub fn launch(args: []const []const u8) !Launch {
+    var result: Launch = .{};
+    var i: usize = 0;
+    if (args.len >= 2 and std.mem.eql(u8, args[0], "--config")) {
+        if (args[1].len == 0) return error.InvalidArguments;
+        result.config = args[1];
+        i = 2;
+    }
+    if (i == args.len) return result;
+    if (!std.mem.eql(u8, args[i], "--") or i + 1 == args.len) return error.InvalidArguments;
+    result.command = args[i + 1 ..];
+    return result;
 }
 
 fn isHelp(arg: []const u8) bool {

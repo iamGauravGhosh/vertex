@@ -8,8 +8,8 @@ pub const Symbols = @import("Symbols.zig");
 const Renderer = @This();
 
 const Colors = @import("../terminal/Colors.zig");
-pub const default_foreground = Colors.foreground;
-pub const default_background = Colors.background;
+pub const default_foreground = 0xff000000 | Colors.foreground;
+pub const default_background = 0xff000000 | Colors.background;
 pub const Rect = struct { x: i32, y: i32, width: i32, height: i32 };
 pub const Image = struct { bitmap: *const vt.Graphics.Bitmap, destination: Rect, source: Rect, clip: Rect };
 pub const PositionedGlyph = struct {
@@ -28,7 +28,20 @@ pub const PositionedGlyph = struct {
     style: vt.Style,
 };
 const Face = struct { face: c.FT_Face, font: *c.hb_font_t, index: usize, variant: u2 = 0 };
-pub const FontOptions = struct { family: []const u8 = "monospace", size: f64 = 12, directory: ?[:0]const u8 = null };
+pub const FontOptions = struct {
+    family: []const u8 = "monospace",
+    size: f64 = 12,
+    directory: ?[:0]const u8 = null,
+    bold_family: ?[]const u8 = null,
+    italic_family: ?[]const u8 = null,
+    bold_italic_family: ?[]const u8 = null,
+    ligatures: bool = false,
+    features: []const []const u8 = &.{},
+    cell_width_offset: i32 = 0,
+    cell_height_offset: i32 = 0,
+    glyph_offset_x: i32 = 0,
+    glyph_offset_y: i32 = 0,
+};
 const Row = struct {
     fingerprint: u64 = 0,
     source: u64 = 0,
@@ -49,6 +62,19 @@ style_sets: [3]*c.FcFontSet,
 point_size: f64,
 faces: std.ArrayList(Face) = .empty,
 bidi: bool = false,
+ligatures: bool = false,
+features: []c.hb_feature_t = &.{},
+user_feature_count: usize = 0,
+glyph_offset_x: i32 = 0,
+glyph_offset_y: i32 = 0,
+theme: Colors.Theme = .{},
+background_opacity: f64 = 1,
+origin_x: usize = 0,
+origin_y: usize = 0,
+cursor_visible: bool = true,
+cursor_hollow: bool = false,
+cursor_thickness: usize = 2,
+cursor_shape: @FieldType(vt.Cursor, "shape") = .block,
 buffer: *c.hb_buffer_t,
 cell_width: usize,
 cell_height: usize,
@@ -91,6 +117,7 @@ pub fn initFontDirectory(allocator: std.mem.Allocator, name: [:0]const u8, direc
 }
 
 pub fn initWithOptions(allocator: std.mem.Allocator, options: FontOptions) !Renderer {
+    inline for (.{ "cell_width_offset", "cell_height_offset", "glyph_offset_x", "glyph_offset_y" }) |field| if (@abs(@field(options, field)) > 256) return error.InvalidFontSpacing;
     if (!std.math.isFinite(options.size) or options.size < 4 or options.size > 128) return error.FontSizeFailed;
     const name = try allocator.dupeSentinel(u8, if (options.family.len == 0) "monospace" else options.family, 0);
     defer allocator.free(name);
@@ -108,12 +135,21 @@ pub fn initWithOptions(allocator: std.mem.Allocator, options: FontOptions) !Rend
     var style_count: usize = 0;
     errdefer for (style_sets[0..style_count]) |set| c.FcFontSetDestroy(set);
     for (&style_sets, 1..) |*set, variant| {
-        const styled = c.FcPatternDuplicate(pattern) orelse return error.OutOfMemory;
+        const override = switch (variant) {
+            1 => options.bold_family,
+            2 => options.italic_family,
+            else => options.bold_italic_family,
+        };
+        const override_name = if (override) |family| try allocator.dupeSentinel(u8, family, 0) else null;
+        defer if (override_name) |family| allocator.free(family);
+        const styled = (if (override_name) |family| c.FcNameParse(family) else c.FcPatternDuplicate(pattern)) orelse return error.OutOfMemory;
         defer c.FcPatternDestroy(styled);
         _ = c.FcPatternDel(styled, c.FC_WEIGHT);
         _ = c.FcPatternDel(styled, c.FC_SLANT);
         _ = c.FcPatternAddInteger(styled, c.FC_WEIGHT, if (variant & 1 != 0) c.FC_WEIGHT_BOLD else c.FC_WEIGHT_REGULAR);
         _ = c.FcPatternAddInteger(styled, c.FC_SLANT, if (variant & 2 != 0) c.FC_SLANT_ITALIC else c.FC_SLANT_ROMAN);
+        _ = c.FcConfigSubstitute(config, styled, c.FcMatchPattern);
+        c.FcDefaultSubstitute(styled);
         set.* = c.FcFontSort(config, styled, c.FcTrue, null, &result) orelse return error.FontNotFound;
         style_count += 1;
     }
@@ -137,8 +173,20 @@ pub fn initWithOptions(allocator: std.mem.Allocator, options: FontOptions) !Rend
     const buffer = c.hb_buffer_create() orelse return error.OutOfMemory;
     errdefer c.hb_buffer_destroy(buffer);
     if (c.hb_buffer_allocation_successful(buffer) == 0) return error.OutOfMemory;
+    const features = try allocator.alloc(c.hb_feature_t, options.features.len + 5);
+    errdefer allocator.free(features);
+    for (options.features, features[0..options.features.len]) |feature, *parsed| if (c.hb_feature_from_string(feature.ptr, @intCast(feature.len), parsed) == 0) return error.InvalidFontFeature;
+    for ([_][:0]const u8{ "liga=0", "clig=0", "dlig=0", "hlig=0", "calt=0" }, 0..) |feature, i| _ = c.hb_feature_from_string(feature, -1, &features[options.features.len + i]);
+    const cell_width = @divTrunc(advance + 63, 64) + options.cell_width_offset;
+    const cell_height = @divTrunc(m.height + 63, 64) + options.cell_height_offset;
+    if (cell_width < 1 or cell_height < 1 or cell_width > 4096 or cell_height > 4096) return error.InvalidFontSpacing;
     return .{
         .allocator = allocator,
+        .features = features,
+        .user_feature_count = options.features.len,
+        .ligatures = options.ligatures,
+        .glyph_offset_x = options.glyph_offset_x,
+        .glyph_offset_y = options.glyph_offset_y,
         .library = library,
         .face = face,
         .font = font,
@@ -146,8 +194,8 @@ pub fn initWithOptions(allocator: std.mem.Allocator, options: FontOptions) !Rend
         .style_sets = style_sets,
         .point_size = options.size,
         .buffer = buffer,
-        .cell_width = @intCast(@max(1, @divTrunc(advance + 63, 64))),
-        .cell_height = @intCast(@max(1, @divTrunc(m.height + 63, 64))),
+        .cell_width = @intCast(cell_width),
+        .cell_height = @intCast(cell_height),
         .ascent = @intCast(@divTrunc(m.ascender + 63, 64)),
         .atlas = Atlas.init(allocator),
         .metrics = std.AutoHashMap(u64, Metrics).init(allocator),
@@ -166,6 +214,7 @@ fn clearRows(self: *Renderer) void {
 
 pub fn deinit(self: *Renderer) void {
     self.clearRows();
+    self.allocator.free(self.features);
     self.levels_scratch.deinit(self.allocator);
     self.scripts_scratch.deinit(self.allocator);
     self.font_cache.deinit(self.allocator);
@@ -191,6 +240,12 @@ pub fn deinit(self: *Renderer) void {
     _ = c.FT_Done_Face(self.face);
     _ = c.FT_Done_FreeType(self.library);
     self.* = undefined;
+}
+
+pub fn setLigatures(self: *Renderer, enabled: bool) void {
+    if (self.ligatures == enabled) return;
+    self.ligatures = enabled;
+    for (self.rows) |*row| row.valid = false;
 }
 
 pub fn setScale(self: *Renderer, scale: usize) !void {
@@ -457,7 +512,10 @@ pub fn shapeRow(self: *Renderer, screen: *const vt.Screen, index: usize) ![]cons
                 c.hb_buffer_add(self.buffer, replacement, @intCast(column));
             }
         }
-        c.hb_shape(selected.font, self.buffer, null, 0);
+        // Overrides follow user features, keeping the toggle authoritative.
+        // Required shaping and contextual forms in complex scripts stay enabled.
+        const feature_count = self.user_feature_count + (if (self.ligatures) @as(usize, 0) else if (script == c.HB_SCRIPT_LATIN or script == c.HB_SCRIPT_COMMON) @as(usize, 5) else @as(usize, 4));
+        c.hb_shape(selected.font, self.buffer, self.features.ptr, @intCast(feature_count));
         if (c.hb_buffer_allocation_successful(self.buffer) == 0) return error.OutOfMemory;
         var count: c_uint = 0;
         const infos = c.hb_buffer_get_glyph_infos(self.buffer, &count);
@@ -614,8 +672,8 @@ fn fitCluster(self: *Renderer, glyphs: []PositionedGlyph, visual: usize, advance
         // Map shared edges consistently, including adjacent glyphs in one cluster.
         g.width = if (g.width == 0) 0 else @intCast(@max(1, @divFloor((g.x + @as(i64, @intCast(g.width)) - left) * numerator, denominator) - x));
         g.height = if (g.height == 0) 0 else @intCast(@max(1, @divFloor((g.y + @as(i64, @intCast(g.height)) - (if (icon) top else @as(i64, 0))) * numerator, denominator) - y));
-        g.x = (origin_x + x) * 64;
-        g.y = (origin_y + y) * 64;
+        g.x = (origin_x + x + @as(i64, self.glyph_offset_x) * @as(i64, @intCast(self.scale))) * 64;
+        g.y = (origin_y + y + @as(i64, self.glyph_offset_y) * @as(i64, @intCast(self.scale))) * 64;
     }
 }
 
@@ -638,37 +696,101 @@ fn load(self: *Renderer, face_index: usize, id: u32, style: vt.Style) !Metrics {
     return .{ .width = (slot.*.bitmap.width * numerator + denominator - 1) / denominator, .height = (slot.*.bitmap.rows * numerator + denominator - 1) / denominator, .left = @intCast(@divTrunc(@as(i64, slot.*.bitmap_left) * @as(i64, @intCast(numerator)), @as(i64, @intCast(denominator)))), .top = @intCast(@divTrunc(@as(i64, slot.*.bitmap_top) * @as(i64, @intCast(numerator)), @as(i64, @intCast(denominator)))) };
 }
 
-pub fn colors(style: vt.Style, cursor: bool) struct { fg: u32, bg: u32 } {
-    var fg = color(style.foreground, default_foreground);
-    var bg = color(style.background, default_background);
+pub fn background(self: *const Renderer) u32 {
+    const alpha: u8 = @intFromFloat(@round(self.background_opacity * 255));
+    return premultiply(self.theme.background, alpha);
+}
+pub fn premultiply(rgb: u32, alpha: u8) u32 {
+    var result = @as(u32, alpha) << 24;
+    inline for (.{ 0, 8, 16 }) |shift| result |= ((((rgb >> shift) & 255) * alpha + 127) / 255) << shift;
+    return result;
+}
+fn themedColor(self: *const Renderer, value: vt.Color, fallback: u32, bold: bool) u32 {
+    return switch (value) {
+        .default => fallback,
+        .rgb => |rgb| (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | rgb.b,
+        .indexed => |index| self.theme.at(if (bold and self.theme.bold_is_bright and index < 8) index + 8 else index),
+    };
+}
+fn colors(self: *const Renderer, style: vt.Style, cursor: bool) struct { fg: u32, bg: u32 } {
+    var fg = self.themedColor(style.foreground, self.theme.foreground, style.bold);
+    var bg = self.themedColor(style.background, self.theme.background, false);
     if (style.inverse) std.mem.swap(u32, &fg, &bg);
-    if (style.faint) fg = blend(fg, bg, 128);
-    if (cursor) std.mem.swap(u32, &fg, &bg);
-    return .{ .fg = fg, .bg = bg };
+    if (style.faint) fg = blend(fg, bg, @intFromFloat(@round(self.theme.dim_factor * 255)));
+    const transparent = style.background == .default and !style.inverse;
+    if (cursor) return .{ .fg = 0xff000000 | (self.theme.cursor_text orelse bg), .bg = 0xff000000 | (self.theme.cursor orelse fg) };
+    return .{ .fg = 0xff000000 | fg, .bg = if (transparent) self.background() else 0xff000000 | bg };
+}
+pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, painter: anytype) !void {
+    var viewport: Viewport(@TypeOf(painter)) = .{
+        .target = painter,
+        .x = @intCast(self.origin_x),
+        .y = @intCast(self.origin_y),
+        .width = @min(painter.width -| self.origin_x, screen.columns * self.cell_width * self.scale),
+        .height = @min(painter.height -| self.origin_y, screen.rows * self.cell_height * self.scale),
+    };
+    try self.paintGrid(screen, dirty, &viewport);
+}
+fn Viewport(comptime T: type) type {
+    return struct {
+        target: T,
+        x: i32,
+        y: i32,
+        width: usize,
+        height: usize,
+        const Self = @This();
+        fn translate(self: *Self, rect: Rect) Rect {
+            return .{ .x = rect.x + self.x, .y = rect.y + self.y, .width = rect.width, .height = rect.height };
+        }
+        fn clip(self: *Self, rect: Rect) Rect {
+            return intersect(rect, .{ .x = 0, .y = 0, .width = @intCast(self.width), .height = @intCast(self.height) });
+        }
+        pub fn fill(self: *Self, rect: Rect, rgb: u32) !void {
+            try self.target.fill(self.translate(self.clip(rect)), rgb);
+        }
+        pub fn mask(self: *Self, atlas: *Atlas, region: Atlas.Region, x: i32, y: i32, rect: Rect, rgb: u32) !void {
+            try self.target.mask(atlas, region, x + self.x, y + self.y, self.translate(self.clip(rect)), rgb);
+        }
+        pub fn image(self: *Self, value: Image) !void {
+            var translated = value;
+            translated.destination = self.translate(value.destination);
+            translated.clip = self.translate(self.clip(value.clip));
+            try self.target.image(translated);
+        }
+        pub fn upload(self: *Self, atlas: *Atlas, region: Atlas.Region) !void {
+            try self.target.upload(atlas, region);
+        }
+        pub fn flush(self: *Self) !void {
+            try self.target.flush();
+        }
+    };
 }
 
 /// Shared draw traversal; painters provide fill, mask, upload, and flush.
-pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, painter: anytype) !void {
+fn paintGrid(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, painter: anytype) !void {
     const cw = self.cell_width * self.scale;
     const ch = self.cell_height * self.scale;
-    const cursor = screen.getCursor();
+    var cursor = screen.getCursor();
+    if (cursor.configured) cursor.shape = self.cursor_shape;
+    cursor.visible = cursor.visible and self.cursor_visible;
+    const solid_block = cursor.shape == .block and !self.cursor_hollow;
     for (dirty, 0..) |changed, row| {
         if (!changed) continue;
         const y: i32 = @intCast(row * ch);
-        try painter.fill(.{ .x = 0, .y = y, .width = @intCast(painter.width), .height = @intCast(ch) }, default_background);
+        try painter.fill(.{ .x = 0, .y = y, .width = @intCast(painter.width), .height = @intCast(ch) }, self.background());
         try self.paintImages(screen, row, 0, painter);
         const cells = screen.getRow(row).?;
         const glyphs = try self.shapeRow(screen, row);
         var background_col: usize = 0;
         while (background_col < cells.len) {
-            const rgb = colors(cells[background_col].style, cursor.visible and cursor.shape == .block and cursor.row == row and cursor.column == background_col);
+            const rgb = self.colors(cells[background_col].style, cursor.visible and solid_block and cursor.row == row and cursor.column == background_col);
             const x = self.visualCached(screen, row, background_col);
             var end = background_col + 1;
             while (end < cells.len) : (end += 1) {
-                const next = colors(cells[end].style, cursor.visible and cursor.shape == .block and cursor.row == row and cursor.column == end);
+                const next = self.colors(cells[end].style, cursor.visible and solid_block and cursor.row == row and cursor.column == end);
                 if (next.bg != rgb.bg or self.visualCached(screen, row, end) != x + end - background_col) break;
             }
-            if (rgb.bg != default_background) try painter.fill(.{ .x = @intCast(x * cw), .y = y, .width = @intCast((end - background_col) * cw), .height = @intCast(ch) }, rgb.bg);
+            if (rgb.bg != self.background()) try painter.fill(.{ .x = @intCast(x * cw), .y = y, .width = @intCast((end - background_col) * cw), .height = @intCast(ch) }, rgb.bg);
             background_col = end;
         }
         try self.paintImages(screen, row, 1, painter);
@@ -714,7 +836,7 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
                     const dy: i32 = @intCast(y + @divFloor(g.y, 64) + @as(i64, @intCast(ty)));
                     // Per-cell clips preserve cursor colors even inside a single ligature.
                     for (g.column..g.paint_end orelse g.end) |col| {
-                        const rgb = colors(g.style, cursor.visible and cursor.shape == .block and cursor.row == row and cursor.column == col);
+                        const rgb = self.colors(g.style, cursor.visible and solid_block and cursor.row == row and cursor.column == col);
                         try painter.mask(&self.atlas, region, dx, dy, .{ .x = @intCast(self.visualCached(screen, row, col) * cw), .y = y, .width = @intCast(cw), .height = @intCast(ch) }, rgb.fg);
                     }
                 }
@@ -722,7 +844,7 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
         }
         for (cells, 0..) |cell, col| {
             if (cell.style.hidden) continue;
-            const rgb = colors(cell.style, cursor.visible and cursor.shape == .block and cursor.row == row and cursor.column == col);
+            const rgb = self.colors(cell.style, cursor.visible and solid_block and cursor.row == row and cursor.column == col);
             const x: i32 = @intCast(self.visualCached(screen, row, col) * cw);
             const baseline: usize = @intCast(@max(0, self.ascent));
             const hovered = if (self.hover) |range| row * screen.columns + col >= range.first and row * screen.columns + col < range.end else false;
@@ -736,11 +858,20 @@ pub fn paint(self: *Renderer, screen: *const vt.Screen, dirty: []const bool, pai
             }
         }
         try self.paintImages(screen, row, 2, painter);
-        if (cursor.visible and cursor.shape != .block and cursor.row == row) {
+        if (cursor.visible and (!solid_block) and cursor.row == row) {
             const x: i32 = @intCast(self.visualCached(screen, row, cursor.column) * cw);
-            const rgb = colors(cells[cursor.column].style, false);
-            const thickness = @min(2 * self.scale, if (cursor.shape == .bar) cw else ch);
-            try painter.fill(.{ .x = x, .y = y + @as(i32, @intCast(if (cursor.shape == .underline) ch - thickness else 0)), .width = @intCast(if (cursor.shape == .bar) thickness else cw), .height = @intCast(if (cursor.shape == .underline) thickness else ch) }, rgb.fg);
+            const rgb = self.colors(cells[cursor.column].style, false);
+            const thickness = @min(self.cursor_thickness * self.scale, if (cursor.shape == .bar) cw else ch);
+            if (self.cursor_hollow and cursor.shape == .block) {
+                const color_cursor = 0xff000000 | (self.theme.cursor orelse (rgb.fg & 0xffffff));
+                const edge = @min(thickness, @min(cw, ch));
+                try painter.fill(.{ .x = x, .y = y, .width = @intCast(cw), .height = @intCast(edge) }, color_cursor);
+                try painter.fill(.{ .x = x, .y = y + @as(i32, @intCast(ch - edge)), .width = @intCast(cw), .height = @intCast(edge) }, color_cursor);
+                try painter.fill(.{ .x = x, .y = y, .width = @intCast(edge), .height = @intCast(ch) }, color_cursor);
+                try painter.fill(.{ .x = x + @as(i32, @intCast(cw - edge)), .y = y, .width = @intCast(edge), .height = @intCast(ch) }, color_cursor);
+                continue;
+            }
+            try painter.fill(.{ .x = x, .y = y + @as(i32, @intCast(if (cursor.shape == .underline) ch - thickness else 0)), .width = @intCast(if (cursor.shape == .bar) thickness else cw), .height = @intCast(if (cursor.shape == .underline) thickness else ch) }, 0xff000000 | (self.theme.cursor orelse (rgb.fg & 0xffffff)));
         }
     }
     try painter.flush();
@@ -811,7 +942,7 @@ pub fn drawRows(self: *Renderer, screen: *const vt.Screen, pixels: []u32, width:
 }
 
 pub fn draw(self: *Renderer, screen: *const vt.Screen, pixels: []u32, width: usize, height: usize) !void {
-    @memset(pixels, default_background);
+    @memset(pixels, self.background());
     const dirty = try self.allocator.alloc(bool, screen.rows);
     defer self.allocator.free(dirty);
     @memset(dirty, true);
@@ -846,7 +977,7 @@ pub const Cpu = struct {
             const sy: usize = @intCast(@as(i64, value.source.y) + @divTrunc((2 * (@as(i64, @intCast(py)) - value.destination.y) + 1) * value.source.height, 2 * @as(i64, value.destination.height)));
             const rgba = value.bitmap.pixels[(sy * value.bitmap.width + sx) * 4 ..][0..4];
             const at = py * self.width + px;
-            var output: u32 = 0;
+            var output: u32 = (@as(u32, rgba[3]) + (((self.pixels[at] >> 24) * (255 - @as(u32, rgba[3])) + 127) / 255)) << 24;
             inline for (.{ 16, 8, 0 }, 0..) |shift, channel| {
                 const v = @as(u32, rgba[channel]) + (((self.pixels[at] >> shift) & 255) * (255 - @as(u32, rgba[3])) + 127) / 255;
                 output |= @as(u32, @min(255, v)) << shift;
@@ -864,14 +995,14 @@ pub const Cpu = struct {
                 const offset = py * self.width + px;
                 const texel = atlas.pages[region.page].pixels[(ay * Atlas.size + ax) * 4 ..][0..4];
                 if (region.color) {
-                    const background = self.pixels[offset];
-                    var output: u32 = 0;
+                    const behind = self.pixels[offset];
+                    var output: u32 = (@as(u32, texel[3]) + (((behind >> 24) * (255 - @as(u32, texel[3])) + 127) / 255)) << 24;
                     inline for (.{ 16, 8, 0 }, 0..) |shift, channel| {
-                        const value = @as(u32, texel[channel]) + (((background >> shift) & 255) * (255 - @as(u32, texel[3])) + 127) / 255;
+                        const value = @as(u32, texel[channel]) + (((behind >> shift) & 255) * (255 - @as(u32, texel[3])) + 127) / 255;
                         output |= @as(u32, @min(255, value)) << shift;
                     }
                     self.pixels[offset] = output;
-                } else self.pixels[offset] = blend(rgb, self.pixels[offset], texel[3]);
+                } else self.pixels[offset] = blend(rgb, self.pixels[offset], texel[3]) | ((@as(u32, texel[3]) + (((self.pixels[offset] >> 24) * (255 - @as(u32, texel[3])) + 127) / 255)) << 24);
             }
         }
     }

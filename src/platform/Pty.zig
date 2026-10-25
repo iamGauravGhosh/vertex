@@ -11,7 +11,12 @@ status: ?u8 = null,
 pub fn spawn(allocator: std.mem.Allocator, command: []const []const u8, rows: usize, columns: usize) !Pty {
     return spawnPixels(allocator, command, rows, columns, 0, 0);
 }
+pub const Env = struct { name: []const u8, value: []const u8 };
+pub const Options = struct { working_directory: ?[]const u8 = null, env: []const Env = &.{} };
 pub fn spawnPixels(allocator: std.mem.Allocator, command: []const []const u8, rows: usize, columns: usize, width: usize, height: usize) !Pty {
+    return spawnConfigured(allocator, command, rows, columns, width, height, .{});
+}
+pub fn spawnConfigured(allocator: std.mem.Allocator, command: []const []const u8, rows: usize, columns: usize, width: usize, height: usize, options: Options) !Pty {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -26,14 +31,29 @@ pub fn spawnPixels(allocator: std.mem.Allocator, command: []const []const u8, ro
     const argv = try scratch.alloc(?[*:0]const u8, arguments.len + 1);
     for (arguments, 0..) |argument, i| argv[i] = (try scratch.dupeSentinel(u8, argument, 0)).ptr;
     argv[arguments.len] = null;
+    const directory = if (options.working_directory) |path| try scratch.dupeSentinel(u8, path, 0) else null;
     var environment: std.ArrayList(?[*:0]const u8) = .empty;
     var index: usize = 0;
     while (c.environ[index] != null) : (index += 1) {
         const value = std.mem.span(c.environ[index]);
         if (std.mem.startsWith(u8, value, "TERM=") or std.mem.startsWith(u8, value, "COLORTERM=")) continue;
-        try environment.append(scratch, c.environ[index]);
+        var overridden = false;
+        for (options.env) |entry| if (std.mem.startsWith(u8, value, entry.name) and value.len > entry.name.len and value[entry.name.len] == '=') {
+            overridden = true;
+            break;
+        };
+        if (!overridden) try environment.append(scratch, c.environ[index]);
     }
-    try environment.appendSlice(scratch, &.{ "TERM=xterm-256color", "COLORTERM=truecolor", null });
+    var term = false;
+    var colorterm = false;
+    for (options.env) |entry| {
+        try environment.append(scratch, try std.fmt.allocPrintSentinel(scratch, "{s}={s}", .{ entry.name, entry.value }, 0));
+        term = term or std.mem.eql(u8, entry.name, "TERM");
+        colorterm = colorterm or std.mem.eql(u8, entry.name, "COLORTERM");
+    }
+    if (!term) try environment.append(scratch, "TERM=xterm-256color");
+    if (!colorterm) try environment.append(scratch, "COLORTERM=truecolor");
+    try environment.append(scratch, null);
     var errors: [2]c_int = undefined;
     if (c.pipe2(&errors, c.O_CLOEXEC) != 0) return error.PipeFailed;
     defer _ = c.close(errors[0]);
@@ -54,6 +74,11 @@ pub fn spawnPixels(allocator: std.mem.Allocator, command: []const []const u8, ro
         for ([_]c_int{ c.SIGINT, c.SIGQUIT, c.SIGTERM, c.SIGHUP, c.SIGCHLD, c.SIGPIPE, c.SIGWINCH, c.SIGTSTP, c.SIGTTIN, c.SIGTTOU }) |signal| {
             _ = c.signal(signal, c.SIG_DFL);
         }
+        if (directory) |path| if (c.chdir(path) != 0) {
+            const failure = -common.errno();
+            _ = c.write(errors[1], &failure, @sizeOf(c_int));
+            c._exit(127);
+        };
         _ = c.execvpe(argv[0].?, @ptrCast(argv.ptr), @ptrCast(environment.items.ptr));
         const failure = common.errno();
         _ = c.write(errors[1], &failure, @sizeOf(c_int));
@@ -68,6 +93,10 @@ pub fn spawnPixels(allocator: std.mem.Allocator, command: []const []const u8, ro
         if (count < 0 and common.errno() == c.EINTR) continue;
         if (count < 0) return error.ExecStatusFailed;
         if (count > 0) {
+            if (failure < 0) {
+                std.debug.print("vertex: cannot enter working directory {s}: {s}\n", .{ options.working_directory orelse "", c.strerror(-failure) });
+                return error.WorkingDirectoryFailed;
+            }
             std.debug.print("vertex: cannot execute {s}: {s}\n", .{ arguments[0], c.strerror(failure) });
             return error.ShellExecFailed;
         }

@@ -11,7 +11,9 @@ const Clipboard = @import("Clipboard.zig");
 const Ime = @import("Ime.zig");
 const Desktop = @import("Desktop.zig");
 const ImageDecoder = @import("ImageDecoder.zig");
-const FontConfig = @import("FontConfig.zig");
+const Config = @import("../Config.zig");
+const Watch = @import("../ConfigWatch.zig");
+const Launch = @import("../cli.zig").Launch;
 
 const Output = struct { app: *App, name: u32, object: *c.wl_output, scale: usize = 1, entered: bool = false };
 const Buffer = struct {
@@ -30,13 +32,16 @@ const Buffer = struct {
     }
 
     fn sync(self: *Buffer, pixels: []const u32, cell_height: usize) void {
+        self.syncAt(pixels, cell_height, 0);
+    }
+    fn syncAt(self: *Buffer, pixels: []const u32, cell_height: usize, origin_y: usize) void {
         std.debug.assert(!self.busy);
         if (self.full_pending) {
             @memcpy(self.pixels, pixels);
         } else for (self.pending_rows, 0..) |changed, row| {
             if (!changed) continue;
-            const start = @min(self.height, row * cell_height) * self.width;
-            const end = @min(self.height, (row + 1) * cell_height) * self.width;
+            const start = @min(self.height, origin_y + row * cell_height) * self.width;
+            const end = @min(self.height, origin_y + (row + 1) * cell_height) * self.width;
             @memcpy(self.pixels[start..end], pixels[start..end]);
         }
         self.full_pending = false;
@@ -44,46 +49,81 @@ const Buffer = struct {
     }
 };
 
+pub fn checkConfig(allocator: std.mem.Allocator, filename: ?[]const u8) !void {
+    var config = try Config.load(allocator, filename);
+    defer config.deinit();
+    var renderer = try configuredRenderer(allocator, config.value.font);
+    defer renderer.deinit();
+    std.debug.print("vertex: configuration valid\n", .{});
+}
+fn configuredRenderer(allocator: std.mem.Allocator, font: Config.Font) !Renderer {
+    return Renderer.initWithOptions(allocator, .{
+        .family = font.family,
+        .size = font.size,
+        .bold_family = font.bold_family,
+        .italic_family = font.italic_family,
+        .bold_italic_family = font.bold_italic_family,
+        .ligatures = font.ligatures,
+        .features = font.features,
+        .cell_width_offset = font.cell_width_offset,
+        .cell_height_offset = font.cell_height_offset,
+        .glyph_offset_x = font.glyph_offset_x,
+        .glyph_offset_y = font.glyph_offset_y,
+    });
+}
 pub fn run(allocator: std.mem.Allocator, command: []const []const u8) !u8 {
+    return runWithOptions(allocator, .{ .command = command });
+}
+pub fn runWithOptions(allocator: std.mem.Allocator, options: Launch) !u8 {
     _ = c.signal(c.SIGPIPE, c.SIG_IGN);
-    const mode_name = c.getenv("VERTEX_RENDERER");
-    const mode = Gpu.Mode.parse(if (mode_name != null) std.mem.span(mode_name) else null) catch {
-        std.debug.print("vertex: VERTEX_RENDERER must be auto, gpu, or cpu\n", .{});
-        return error.InvalidRenderer;
-    };
-    const font_config = FontConfig.load(allocator) catch |err| {
-        std.debug.print("vertex: font config: {s} (font_family and font_size, 4–128 pt)\n", .{@errorName(err)});
+    var snapshot = try Config.load(allocator, options.config);
+    const renderer = configuredRenderer(allocator, snapshot.value.font) catch |err| {
+        snapshot.deinit();
         return err;
     };
-    defer allocator.free(font_config.font_family);
     var app: App = .{
         .allocator = allocator,
+        .snapshot = snapshot,
+        .settings = snapshot.value,
         .clipboard = .{ .allocator = allocator },
         .ime = .{ .allocator = allocator },
-        .renderer = try Renderer.initWithOptions(allocator, .{ .family = font_config.font_family, .size = font_config.font_size }),
+        .renderer = renderer,
         .screen = undefined,
         .session = undefined,
-        .mode = mode,
+        .mode = @fromBackingInt(@intCast(@backingInt(snapshot.value.terminal.renderer))),
         .damage = Renderer.Damage.init(allocator),
     };
     defer app.deinit();
-    app.session = try vt.Session.initWithOptions(allocator, 24, 80, .{ .images = true, .decoder = ImageDecoder.decode });
+    app.session = try vt.Session.initWithOptions(allocator, app.settings.window.rows, app.settings.window.columns, .{ .images = true, .decoder = ImageDecoder.decode });
     app.screen = app.session.activeScreen();
     app.screen_ready = true;
-    const bidi = c.getenv("VERTEX_BIDI");
-    if (bidi != null) {
-        const value = std.mem.span(bidi);
-        if (!std.mem.eql(u8, value, "off") and !std.mem.eql(u8, value, "auto")) return error.InvalidBidi;
-        app.renderer.bidi = std.mem.eql(u8, value, "auto");
-    }
-    app.width = 80 * app.renderer.cell_width;
-    app.height = 24 * app.renderer.cell_height;
+    app.applyPresentation();
+    app.width = app.settings.window.columns * app.renderer.cell_width + app.settings.window.padding.left + app.settings.window.padding.right;
+    app.height = app.settings.window.rows * app.renderer.cell_height + app.settings.window.padding.top + app.settings.window.padding.bottom;
+    if (app.settings.general.live_reload) app.watch = try Watch.init(allocator, app.snapshot.?.files.items);
     try app.connect();
-    return app.loop(command);
+    return app.loop(options.command);
 }
 
 const App = struct {
     allocator: std.mem.Allocator,
+    snapshot: ?Config = null,
+    settings: Config.Values = .{},
+    watch: Watch = .{},
+    reload_requested: bool = false,
+    blink_start: i64 = 0,
+    blink_cursor: ?vt.Cursor = null,
+    cursor_deadline: ?i64 = null,
+    consumed_keys: [256]?Config.Action = @splat(null),
+    fullscreen: bool = false,
+    pointer_serial: u32 = 0,
+    pointer_hidden: bool = false,
+    cursor_manager: ?*c.wp_cursor_shape_manager_v1 = null,
+    cursor_device: ?*c.wp_cursor_shape_device_v1 = null,
+    decoration_manager: ?*c.zxdg_decoration_manager_v1 = null,
+    decoration: ?*c.zxdg_toplevel_decoration_v1 = null,
+    content_x: usize = 0,
+    content_y: usize = 0,
     renderer: Renderer,
     screen: *vt.Screen,
     session: vt.Session = undefined,
@@ -116,6 +156,7 @@ const App = struct {
     pointer_buttons: u8 = 0,
     pointer_last: ?[2]usize = null,
     link_click: bool = false,
+    paste_click: ?u8 = null,
     desktop: Desktop = .{},
     open_uri: *const fn (*App, []const u8) anyerror!void = openUri,
     axes: [2]f64 = @splat(0),
@@ -150,6 +191,127 @@ const App = struct {
     closing: bool = false,
     failure: ?anyerror = null,
 
+    fn applyPresentation(self: *App) void {
+        self.renderer.theme = self.settings.colors;
+        self.session.theme = self.settings.colors;
+        self.session.setCursorDefaults(self.settings.cursor.shape, self.settings.cursor.blinking);
+        self.renderer.bidi = self.settings.terminal.bidi == .auto;
+        self.renderer.background_opacity = if (self.focused) self.settings.window.opacity else self.settings.window.unfocused_opacity orelse self.settings.window.opacity;
+        self.renderer.cursor_shape = self.settings.cursor.shape;
+        self.renderer.cursor_thickness = self.settings.cursor.thickness;
+        self.renderer.cursor_hollow = !self.focused and self.settings.cursor.unfocused_hollow;
+        if (!self.settings.mouse.hide_when_typing) self.showPointer();
+        if (self.damage) |*damage| damage.invalidate();
+    }
+    fn setTitle(self: *App, title: []const u8) !void {
+        if (self.toplevel == null) return;
+        const name = try self.allocator.dupeSentinel(u8, title, 0);
+        defer self.allocator.free(name);
+        c.xdg_toplevel_set_title(self.toplevel, name);
+    }
+    fn reload(self: *App) !void {
+        const current = if (self.snapshot) |*snapshot| snapshot else return;
+        var candidate = try Config.init(self.allocator);
+        errdefer candidate.deinit();
+        candidate.read(current.root, current.explicit, true) catch |err| {
+            if (self.watch.fd >= 0) self.watch.addPaths(candidate.files.items) catch {};
+            return err;
+        };
+        var renderer = try configuredRenderer(self.allocator, candidate.value.font);
+        errdefer renderer.deinit();
+        try renderer.setScale(self.scale);
+        var watch = if (candidate.value.general.live_reload) try Watch.init(self.allocator, candidate.files.items) else Watch{};
+        errdefer watch.deinit();
+        const title = if (candidate.value.window.dynamic_title and self.session.title_len != 0) self.session.title[0..self.session.title_len] else candidate.value.window.title;
+        const title_z = try self.allocator.dupeSentinel(u8, title, 0);
+        defer self.allocator.free(title_z);
+        // Reserve both grids before replacing any active settings or resources.
+        const padding = candidate.value.window.padding;
+        const rows = @max(1, (self.height -| (@as(usize, padding.top) + padding.bottom)) / renderer.cell_height);
+        const columns = @max(1, (self.width -| (@as(usize, padding.left) + padding.right)) / renderer.cell_width);
+        try self.session.resize(rows, columns);
+        const restart = !std.meta.eql(self.settings.window.startup_mode, candidate.value.window.startup_mode) or
+            !std.mem.eql(u8, self.settings.window.app_id, candidate.value.window.app_id) or
+            self.settings.window.decorations != candidate.value.window.decorations or
+            self.settings.window.columns != candidate.value.window.columns or self.settings.window.rows != candidate.value.window.rows or
+            self.settings.terminal.renderer != candidate.value.terminal.renderer or
+            !std.mem.eql(u8, self.settings.terminal.working_directory orelse "", candidate.value.terminal.working_directory orelse "") or
+            !stringArraysEqual(self.settings.terminal.shell, candidate.value.terminal.shell) or !envEqual(self.settings.terminal.env, candidate.value.terminal.env);
+        self.renderer.deinit();
+        self.watch.deinit();
+        var previous = self.snapshot.?;
+        self.snapshot = candidate;
+        self.settings = candidate.value;
+        self.renderer = renderer;
+        if (self.gpu) |*gpu| gpu.invalidateAtlas();
+        self.watch = watch;
+        previous.deinit();
+        self.blink_start = common.milliseconds();
+        self.blink_cursor = null;
+        self.size_changed = true;
+        self.applyPresentation();
+        if (self.toplevel != null) c.xdg_toplevel_set_title(self.toplevel, title_z);
+        if (restart) std.debug.print("vertex: config reloaded; launch settings apply to new windows\n", .{});
+    }
+    fn updateCursor(self: *App) void {
+        if (!self.screen_ready) return;
+        const cursor = self.screen.getCursor();
+        const now = common.milliseconds();
+        if (self.blink_cursor == null or !std.meta.eql(self.blink_cursor.?, cursor)) {
+            self.blink_start = now;
+            self.blink_cursor = cursor;
+        }
+        const blinking = self.focused and cursor.visible and (if (cursor.configured) self.settings.cursor.blinking else cursor.blinking);
+        const interval: i64 = self.settings.cursor.blink_interval;
+        const visible = !blinking or @mod(@divTrunc(now - self.blink_start, interval), 2) == 0;
+        self.cursor_deadline = if (blinking) now + interval - @mod(now - self.blink_start, interval) else null;
+        if (self.renderer.cursor_visible != visible) {
+            self.renderer.cursor_visible = visible;
+            self.screen.damage_rows[cursor.row] = true;
+        }
+    }
+    fn showPointer(self: *App) void {
+        if (!self.pointer_hidden) return;
+        if (self.cursor_device) |device| c.wp_cursor_shape_device_v1_set_shape(device, self.pointer_serial, c.WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+        self.pointer_hidden = false;
+    }
+    fn performAction(self: *App, binding: Config.Binding) !void {
+        switch (binding.action) {
+            .paste, .paste_primary => try self.clipboard.request(binding.action == .paste_primary),
+            .reload => self.reload_requested = true,
+            .fullscreen => {
+                self.fullscreen = !self.fullscreen;
+                if (self.toplevel != null) {
+                    if (self.fullscreen) c.xdg_toplevel_set_fullscreen(self.toplevel, null) else c.xdg_toplevel_unset_fullscreen(self.toplevel);
+                }
+            },
+            .font_increase, .font_decrease, .font_reset => {
+                var font = self.settings.font;
+                font.size = if (binding.action == .font_reset) (if (self.snapshot) |snapshot| snapshot.value.font.size else 12) else std.math.clamp(font.size + @as(f64, if (binding.action == .font_increase) 1 else -1), 4, 128);
+                var replacement = try configuredRenderer(self.allocator, font);
+                errdefer replacement.deinit();
+                try replacement.setScale(self.scale);
+                self.renderer.deinit();
+                self.renderer = replacement;
+                if (self.gpu) |*gpu| gpu.invalidateAtlas();
+                self.settings.font = font;
+                self.size_changed = true;
+                self.applyPresentation();
+            },
+            .opacity_increase, .opacity_decrease => {
+                self.settings.window.opacity = std.math.clamp(self.settings.window.opacity + @as(f64, if (binding.action == .opacity_increase) 0.05 else -0.05), 0, 1);
+                self.applyPresentation();
+            },
+            .send_text => if (binding.text) |bytes| try self.queue(bytes),
+            .launch => try self.desktop.launch(self.allocator, binding.command),
+            .new_window => {
+                const command: []const []const u8 = if (self.snapshot) |snapshot| if (snapshot.root) |root| &.{ "/proc/self/exe", "--config", root } else &.{"/proc/self/exe"} else &.{"/proc/self/exe"};
+                try self.desktop.launch(self.allocator, command);
+            },
+            .none, .ignore => {},
+        }
+    }
+
     fn connect(self: *App) !void {
         self.display = c.wl_display_connect(null) orelse {
             std.debug.print("vertex: cannot connect to Wayland; check WAYLAND_DISPLAY and XDG_RUNTIME_DIR\n", .{});
@@ -172,8 +334,25 @@ const App = struct {
         _ = c.xdg_surface_add_listener(self.xdg_surface, &xdg_surface_listener, self);
         self.toplevel = c.xdg_surface_get_toplevel(self.xdg_surface) orelse return error.WaylandObjectFailed;
         _ = c.xdg_toplevel_add_listener(self.toplevel, &toplevel_listener, self);
-        c.xdg_toplevel_set_title(self.toplevel, "Vertex");
-        c.xdg_toplevel_set_app_id(self.toplevel, "vertex");
+        try self.setTitle(self.settings.window.title);
+        const app_id = try self.allocator.dupeSentinel(u8, self.settings.window.app_id, 0);
+        defer self.allocator.free(app_id);
+        c.xdg_toplevel_set_app_id(self.toplevel, app_id);
+        if (self.decoration_manager) |manager| {
+            self.decoration = c.zxdg_decoration_manager_v1_get_toplevel_decoration(manager, self.toplevel);
+            if (self.decoration) |decoration| {
+                _ = c.zxdg_toplevel_decoration_v1_add_listener(decoration, &decoration_listener, self);
+                c.zxdg_toplevel_decoration_v1_set_mode(decoration, if (self.settings.window.decorations == .server) c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE else c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+            }
+        }
+        switch (self.settings.window.startup_mode) {
+            .windowed => {},
+            .maximized => c.xdg_toplevel_set_maximized(self.toplevel),
+            .fullscreen => {
+                self.fullscreen = true;
+                c.xdg_toplevel_set_fullscreen(self.toplevel, null);
+            },
+        }
         c.xdg_toplevel_set_min_size(self.toplevel, @intCast(self.renderer.cell_width), @intCast(self.renderer.cell_height));
         self.clipboard.setup(self.seat);
         self.ime.surface = self.surface;
@@ -184,6 +363,15 @@ const App = struct {
     fn loop(self: *App, command: []const []const u8) !u8 {
         while (!self.closing) {
             self.desktop.poll();
+            if (self.watch.poll() or self.reload_requested) {
+                self.reload_requested = false;
+                self.reload() catch |err| std.debug.print("vertex: config reload rejected ({s}); keeping active settings\n", .{@errorName(err)});
+            }
+            self.updateCursor();
+            if (self.session.title_changed) {
+                self.session.title_changed = false;
+                if (self.settings.window.dynamic_title) try self.setTitle(self.session.title[0..self.session.title_len]);
+            }
             if (self.failure) |failure| return failure;
             if (self.clipboard.failure) |failure| return failure;
             if (self.ime.failure) |failure| return failure;
@@ -192,7 +380,7 @@ const App = struct {
                 self.ime.changed = false;
             }
             const cursor = self.screen.getCursor();
-            if (self.ime.preedit.len == 0) self.ime.cursor(@intCast((try self.renderer.visualColumn(self.screen, cursor.row, cursor.column)) * self.renderer.cell_width), @intCast(cursor.row * self.renderer.cell_height), @intCast(self.renderer.cell_width), @intCast(self.renderer.cell_height));
+            if (self.ime.preedit.len == 0) self.ime.cursor(@intCast(self.content_x + (try self.renderer.visualColumn(self.screen, cursor.row, cursor.column)) * self.renderer.cell_width), @intCast(self.content_y + cursor.row * self.renderer.cell_height), @intCast(self.renderer.cell_width), @intCast(self.renderer.cell_height));
             if (self.ime.committed.items.len != 0) {
                 if (self.session.getModes().kitty & 8 != 0) {
                     const encoded = try self.allocator.alloc(u8, self.ime.committed.items.len * 12 + 32);
@@ -204,7 +392,7 @@ const App = struct {
             if (self.configured) {
                 try self.applySize();
                 if (self.pty == null) {
-                    self.pty = try Pty.spawnPixels(self.allocator, command, self.screen.rows, self.screen.columns, self.session.geometry.width, self.session.geometry.height);
+                    self.pty = try Pty.spawnConfigured(self.allocator, if (command.len != 0) command else self.settings.terminal.shell, self.screen.rows, self.screen.columns, self.session.geometry.width, self.session.geometry.height, .{ .working_directory = self.settings.terminal.working_directory, .env = self.settings.terminal.env });
                 }
                 try self.flushInput();
                 try self.drainPty();
@@ -219,6 +407,7 @@ const App = struct {
                 try self.clipboard.publish();
                 self.clipboard.pump();
                 try self.updateHover();
+                self.updateCursor();
                 try self.draw();
             }
             while (c.wl_display_prepare_read(self.display) != 0) {
@@ -240,12 +429,15 @@ const App = struct {
                 .{ .fd = -1, .events = c.POLLOUT, .revents = 0 },
                 .{ .fd = -1, .events = c.POLLOUT, .revents = 0 },
                 .{ .fd = -1, .events = c.POLLOUT, .revents = 0 },
+                .{ .fd = self.watch.fd, .events = c.POLLIN, .revents = 0 },
             };
             for (self.clipboard.transfers, 0..) |slot, i| if (slot) |transfer| {
                 fds[4 + i].fd = transfer.fd;
             };
             var timeout: c_int = 100;
             if (self.session.sync_deadline_ms) |deadline| timeout = @intCast(std.math.clamp(deadline - common.milliseconds(), 0, timeout));
+            if (self.watch.deadline) |deadline| timeout = @min(timeout, @as(c_int, @intCast(std.math.clamp(deadline - common.milliseconds(), 0, 100))));
+            if (self.cursor_deadline) |deadline| timeout = @min(timeout, @as(c_int, @intCast(std.math.clamp(deadline - common.milliseconds(), 0, 100))));
             const result = c.poll(&fds, fds.len, timeout);
             if (result < 0) {
                 if (common.errno() == c.EINTR) continue;
@@ -293,11 +485,22 @@ const App = struct {
         if (self.width > 16384 or self.height > 16384) return error.WindowTooLarge;
         const area = std.math.mul(usize, self.width * self.scale, self.height * self.scale) catch return error.WindowTooLarge;
         if (area > 64 * 1024 * 1024) return error.WindowTooLarge;
-        const rows = @max(1, self.height / self.renderer.cell_height);
-        const columns = @max(1, self.width / self.renderer.cell_width);
+        const pad = self.settings.window.padding;
+        const available_width = self.width -| (@as(usize, pad.left) + pad.right);
+        const available_height = self.height -| (@as(usize, pad.top) + pad.bottom);
+        const rows = @max(1, available_height / self.renderer.cell_height);
+        const columns = @max(1, available_width / self.renderer.cell_width);
+        self.content_x = @min(self.width -| 1, pad.left);
+        self.content_y = @min(self.height -| 1, pad.top);
+        if (self.settings.window.dynamic_padding) {
+            self.content_x += (available_width -| (columns * self.renderer.cell_width)) / 2;
+            self.content_y += (available_height -| (rows * self.renderer.cell_height)) / 2;
+        }
+        self.renderer.origin_x = self.content_x * self.scale;
+        self.renderer.origin_y = self.content_y * self.scale;
         try self.session.resize(rows, columns);
         try self.renderer.setScale(self.scale);
-        self.session.geometry = .{ .width = self.width * self.scale, .height = self.height * self.scale, .cell_width = self.renderer.cell_width * self.scale, .cell_height = self.renderer.cell_height * self.scale };
+        self.session.geometry = .{ .width = columns * self.renderer.cell_width * self.scale, .height = rows * self.renderer.cell_height * self.scale, .cell_width = self.renderer.cell_width * self.scale, .cell_height = self.renderer.cell_height * self.scale };
         if (self.pty) |*pty| try pty.resizePixels(rows, columns, self.session.geometry.width, self.session.geometry.height);
         c.wl_surface_set_buffer_scale(self.surface, @intCast(self.scale));
         for (self.buffers.items) |buffer| {
@@ -399,11 +602,12 @@ const App = struct {
             if (self.ime.cursor_begin < 0) displayed.cursor.visible = false;
             @memcpy(displayed.damage_rows, self.screen.getDamageRows());
             const point = displayed.cursor;
-            self.ime.cursor(@intCast((try self.renderer.visualColumn(displayed, point.row, point.column)) * self.renderer.cell_width), @intCast(point.row * self.renderer.cell_height), @intCast(self.renderer.cell_width), @intCast(self.renderer.cell_height));
+            self.ime.cursor(@intCast(self.content_x + (try self.renderer.visualColumn(displayed, point.row, point.column)) * self.renderer.cell_width), @intCast(self.content_y + point.row * self.renderer.cell_height), @intCast(self.renderer.cell_width), @intCast(self.renderer.cell_height));
         }
         const width = self.width * self.scale;
         const height = self.height * self.scale;
         const damage = &self.damage.?;
+        damage.origin_y = self.renderer.origin_y;
         if (!try damage.prepare(displayed, width, height, self.renderer.cell_height * self.scale)) return;
         if (!self.backend_started) {
             self.backend_started = true;
@@ -446,13 +650,13 @@ const App = struct {
             damage.invalidate();
             _ = try damage.prepare(displayed, width, height, self.renderer.cell_height * self.scale);
         }
-        if (damage.full) @memset(self.pixels, Renderer.default_background);
+        if (damage.full) @memset(self.pixels, self.renderer.background());
         try self.renderer.drawRows(displayed, self.pixels, width, height, damage.rows);
         for (self.buffers.items) |item| {
             if (item.retired) continue;
             item.track(damage);
         }
-        buffer.sync(self.pixels, self.renderer.cell_height * self.scale);
+        buffer.syncAt(self.pixels, self.renderer.cell_height * self.scale, self.renderer.origin_y);
         try self.requestFrame();
         c.wl_surface_attach(self.surface, buffer.object, 0, 0);
         for (damage.rects.items) |rect| c.wl_surface_damage_buffer(self.surface, rect.x, rect.y, rect.width, rect.height);
@@ -467,8 +671,9 @@ const App = struct {
     }
     fn linkAtPointer(self: *App) !?vt.Links.Match {
         if (!self.pointer_inside or !self.screen_ready or self.pointer_x < 0 or self.pointer_y < 0) return null;
-        const col: usize = @intFromFloat(@floor(self.pointer_x / @as(f64, @floatFromInt(self.renderer.cell_width))));
-        const row: usize = @intFromFloat(@floor(self.pointer_y / @as(f64, @floatFromInt(self.renderer.cell_height))));
+        if (self.pointer_x < @as(f64, @floatFromInt(self.content_x)) or self.pointer_y < @as(f64, @floatFromInt(self.content_y))) return null;
+        const col: usize = @intFromFloat(@floor((self.pointer_x - @as(f64, @floatFromInt(self.content_x))) / @as(f64, @floatFromInt(self.renderer.cell_width))));
+        const row: usize = @intFromFloat(@floor((self.pointer_y - @as(f64, @floatFromInt(self.content_y))) / @as(f64, @floatFromInt(self.renderer.cell_height))));
         if (row >= self.screen.rows or col >= self.screen.columns) return null;
         const logical = try self.renderer.logicalColumn(self.screen, row, col);
         return vt.Links.find(self.allocator, self.screen, row, logical);
@@ -501,7 +706,7 @@ const App = struct {
         errdefer _ = c.munmap(memory, length);
         const pool = c.wl_shm_create_pool(self.shm, fd, @intCast(length)) orelse return error.WaylandObjectFailed;
         defer c.wl_shm_pool_destroy(pool);
-        const object = c.wl_shm_pool_create_buffer(pool, 0, @intCast(width), @intCast(height), @intCast(width * 4), c.WL_SHM_FORMAT_XRGB8888) orelse return error.WaylandObjectFailed;
+        const object = c.wl_shm_pool_create_buffer(pool, 0, @intCast(width), @intCast(height), @intCast(width * 4), c.WL_SHM_FORMAT_ARGB8888) orelse return error.WaylandObjectFailed;
         errdefer c.wl_buffer_destroy(object);
         const buffer = try self.allocator.create(Buffer);
         errdefer self.allocator.destroy(buffer);
@@ -545,8 +750,28 @@ const App = struct {
 
     fn sendKey(self: *App, key: u32, action: vt.Input.Action) !bool {
         if (!self.focused or self.key_state == null) return false;
+        if (key < self.consumed_keys.len) if (self.consumed_keys[key]) |consumed| {
+            if (action == .release) self.consumed_keys[key] = null;
+            if (action == .repeat and (consumed == .font_increase or consumed == .font_decrease or consumed == .opacity_increase or consumed == .opacity_decrease)) {
+                try self.performAction(.{ .action = consumed });
+                return true;
+            }
+            if (action != .press) return false;
+        };
         if (action == .release and (key >= self.pressed.len or self.pressed[key] == null)) return false;
         const state = self.key_state.?;
+        if (action == .press) {
+            self.blink_start = common.milliseconds();
+            const symbol = c.xkb_state_key_get_one_sym(state, key);
+            const mask = Config.modifierBits(self.modifiers());
+            for (self.settings.keyboard.bindings) |binding| {
+                if (c.xkb_keysym_to_lower(symbol) != c.xkb_keysym_to_lower(Config.keySymbol(binding.key)) or mask != try Config.parseModifiers(binding.mods)) continue;
+                if (binding.action == .none) break;
+                if (key < self.consumed_keys.len) self.consumed_keys[key] = binding.action;
+                try self.performAction(binding);
+                return binding.action == .font_increase or binding.action == .font_decrease or binding.action == .opacity_increase or binding.action == .opacity_decrease;
+            }
+        }
         var symbol = c.xkb_state_key_get_one_sym(state, key);
         var text_buffer: [96]u8 = undefined;
         var text_len = c.xkb_state_key_get_utf8(state, key, &text_buffer, text_buffer.len);
@@ -580,10 +805,6 @@ const App = struct {
         }
         if (text_len < 0 or text_len >= text_buffer.len) return false;
         const mods = self.modifiers();
-        if (action == .press and mods.shift and ((mods.control and (symbol == 'v' or symbol == 'V')) or symbol == c.XKB_KEY_Insert)) {
-            try self.clipboard.request(symbol == c.XKB_KEY_Insert);
-            return false;
-        }
         var unshifted: [*c]const c.xkb_keysym_t = null;
         const layout = c.xkb_state_key_get_layout(state, key);
         const count = c.xkb_keymap_key_get_syms_by_level(self.keymap, key, layout, 0, &unshifted);
@@ -660,6 +881,11 @@ const App = struct {
     }
     fn deinit(self: *App) void {
         if (self.pty) |*pty| pty.deinit();
+        self.watch.deinit();
+        if (self.cursor_device) |object| c.wp_cursor_shape_device_v1_destroy(object);
+        if (self.cursor_manager) |object| c.wp_cursor_shape_manager_v1_destroy(object);
+        if (self.decoration) |object| c.zxdg_toplevel_decoration_v1_destroy(object);
+        if (self.decoration_manager) |object| c.zxdg_decoration_manager_v1_destroy(object);
         if (self.repeat_fd >= 0) _ = c.close(self.repeat_fd);
         if (self.frame) |object| c.wl_callback_destroy(object);
         self.clipboard.deinit();
@@ -698,8 +924,22 @@ const App = struct {
         self.renderer.deinit();
         if (self.damage) |*damage| damage.deinit();
         self.allocator.free(self.pixels);
+        if (self.snapshot) |*snapshot| snapshot.deinit();
     }
 };
+
+fn stringArraysEqual(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+fn envEqual(a: []const Config.Env, b: []const Config.Env) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x.name, y.name) or !std.mem.eql(u8, x.value, y.value)) return false;
+    return true;
+}
+fn decorationConfigure(_: ?*anyopaque, _: ?*c.zxdg_toplevel_decoration_v1, _: u32) callconv(.c) void {}
+const decoration_listener: c.zxdg_toplevel_decoration_v1_listener = .{ .configure = decorationConfigure };
 
 fn destroyBuffer(allocator: std.mem.Allocator, buffer: *Buffer) void {
     c.wl_buffer_destroy(buffer.object);
@@ -724,6 +964,10 @@ fn registryGlobal(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32, inter
             return;
         }
         self.compositor = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_compositor_interface, 4));
+    } else if (std.mem.eql(u8, kind, "wp_cursor_shape_manager_v1") and self.cursor_manager == null) {
+        self.cursor_manager = @ptrCast(c.wl_registry_bind(registry, name, &c.wp_cursor_shape_manager_v1_interface, 1));
+    } else if (std.mem.eql(u8, kind, "zxdg_decoration_manager_v1") and self.decoration_manager == null) {
+        self.decoration_manager = @ptrCast(c.wl_registry_bind(registry, name, &c.zxdg_decoration_manager_v1_interface, 1));
     } else if (std.mem.eql(u8, kind, "wl_shm") and self.shm == null) {
         self.shm = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_shm_interface, 1));
     } else if (std.mem.eql(u8, kind, "xdg_wm_base") and self.wm == null) {
@@ -782,8 +1026,17 @@ fn surfaceConfigure(data: ?*anyopaque, surface: ?*c.xdg_surface, serial: u32) ca
     self.configured = true;
     self.size_changed = true;
 }
-fn toplevelConfigure(data: ?*anyopaque, _: ?*c.xdg_toplevel, width: i32, height: i32, _: ?*c.wl_array) callconv(.c) void {
+fn toplevelConfigure(data: ?*anyopaque, _: ?*c.xdg_toplevel, width: i32, height: i32, states: ?*c.wl_array) callconv(.c) void {
     const self = appFrom(data);
+    self.fullscreen = false;
+    if (states) |array| {
+        if (array.size != 0 and array.data != null) {
+            const values: [*]align(1) const u32 = @ptrCast(array.data.?);
+            for (values[0 .. array.size / @sizeOf(u32)]) |state| if (state == c.XDG_TOPLEVEL_STATE_FULLSCREEN) {
+                self.fullscreen = true;
+            };
+        }
+    }
     self.pending_width = @intCast(@max(0, width));
     self.pending_height = @intCast(@max(0, height));
 }
@@ -830,6 +1083,8 @@ fn seatCapabilities(data: ?*anyopaque, seat: ?*c.wl_seat, capabilities: u32) cal
         self.pointer = c.wl_seat_get_pointer(seat);
         if (self.pointer) |pointer| _ = c.wl_pointer_add_listener(pointer, &pointer_listener, self);
     } else if ((capabilities & c.WL_SEAT_CAPABILITY_POINTER) == 0 and self.pointer != null) {
+        if (self.cursor_device) |device| c.wp_cursor_shape_device_v1_destroy(device);
+        self.cursor_device = null;
         releasePointer(self.pointer.?);
         self.pointer = null;
         self.pointer_inside = false;
@@ -881,6 +1136,8 @@ fn keyboardKeymap(data: ?*anyopaque, _: ?*c.wl_keyboard, format: u32, fd: i32, s
 fn keyboardEnter(data: ?*anyopaque, _: ?*c.wl_keyboard, _: u32, _: ?*c.wl_surface, _: ?*c.wl_array) callconv(.c) void {
     const self = appFrom(data);
     self.focused = true;
+    self.blink_start = common.milliseconds();
+    if (self.screen_ready) self.applyPresentation();
     if (self.screen_ready and self.session.modes.focus) self.queue("\x1b[I") catch |err| {
         self.failure = err;
     };
@@ -891,6 +1148,8 @@ fn keyboardLeave(data: ?*anyopaque, _: ?*c.wl_keyboard, _: u32, _: ?*c.wl_surfac
         self.failure = err;
     };
     self.focused = false;
+    if (self.screen_ready) self.applyPresentation();
+    self.consumed_keys = @splat(null);
     self.clipboard.focused = false;
     self.clipboard.serial = null;
     self.clipboard.cancel();
@@ -902,7 +1161,13 @@ fn keyboardLeave(data: ?*anyopaque, _: ?*c.wl_keyboard, _: u32, _: ?*c.wl_surfac
 }
 fn keyboardKey(data: ?*anyopaque, _: ?*c.wl_keyboard, serial: u32, _: u32, raw_key: u32, state: u32) callconv(.c) void {
     const self = appFrom(data);
-    if (state == c.WL_KEYBOARD_KEY_STATE_PRESSED) self.clipboard.serial = serial;
+    if (state == c.WL_KEYBOARD_KEY_STATE_PRESSED) {
+        self.clipboard.serial = serial;
+        if (self.settings.mouse.hide_when_typing and self.pointer_inside and self.cursor_device != null) {
+            c.wl_pointer_set_cursor(self.pointer, self.pointer_serial, null, 0, 0);
+            self.pointer_hidden = true;
+        }
+    }
     const key = raw_key + 8;
     if (key < self.physical_down.len) self.physical_down[key] = state == c.WL_KEYBOARD_KEY_STATE_PRESSED;
     if (state == c.WL_KEYBOARD_KEY_STATE_RELEASED) {
@@ -945,17 +1210,22 @@ fn releasePointer(object: *c.wl_pointer) void {
 }
 fn sendPointer(self: *App, kind: @FieldType(vt.Input.Pointer, "kind"), button: u8) void {
     if (!self.pointer_inside or !self.screen_ready) return;
-    if (self.link_click and kind == .motion) return;
-    const x: usize = @intFromFloat(@max(0, self.pointer_x));
-    const y: usize = @intFromFloat(@max(0, self.pointer_y));
+    if ((self.link_click or self.paste_click != null) and kind == .motion) return;
+    const mods = self.modifiers();
+    if (Config.modifierHeld(self.settings.mouse.reporting_bypass, mods)) return;
+    if (self.pointer_x < @as(f64, @floatFromInt(self.content_x)) or self.pointer_y < @as(f64, @floatFromInt(self.content_y))) return;
+    const x: usize = @intFromFloat(@max(0, self.pointer_x - @as(f64, @floatFromInt(self.content_x))));
+    const y: usize = @intFromFloat(@max(0, self.pointer_y - @as(f64, @floatFromInt(self.content_y))));
+    if (x >= self.screen.columns * self.renderer.cell_width or y >= self.screen.rows * self.renderer.cell_height) return;
     const col = @min(self.screen.columns - 1, x / self.renderer.cell_width);
     const row = @min(self.screen.rows - 1, y / self.renderer.cell_height);
-    const mode = self.session.getModes();
+    var mode = self.session.getModes();
+    mode.mouse_shift_bypass = false;
     const location = [2]usize{ if (mode.mouse_pixels) x else col, if (mode.mouse_pixels) y else row };
     if (kind == .motion and self.pointer_last != null and std.mem.eql(usize, &location, &self.pointer_last.?)) return;
     self.pointer_last = location;
     var buffer: [128]u8 = undefined;
-    const bytes = vt.Input.encodePointer(&buffer, .{ .kind = kind, .button = button, .column = col, .row = row, .x = x, .y = y, .modifiers = self.modifiers() }, mode) catch |err| {
+    const bytes = vt.Input.encodePointer(&buffer, .{ .kind = kind, .button = button, .column = col, .row = row, .x = x, .y = y, .modifiers = mods }, mode) catch |err| {
         self.failure = err;
         return;
     };
@@ -963,9 +1233,15 @@ fn sendPointer(self: *App, kind: @FieldType(vt.Input.Pointer, "kind"), button: u
         self.failure = err;
     };
 }
-fn pointerEnter(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: ?*c.wl_surface, x: c.wl_fixed_t, y: c.wl_fixed_t) callconv(.c) void {
+fn pointerEnter(data: ?*anyopaque, _: ?*c.wl_pointer, serial: u32, _: ?*c.wl_surface, x: c.wl_fixed_t, y: c.wl_fixed_t) callconv(.c) void {
     const self = appFrom(data);
     self.pointer_inside = true;
+    self.pointer_serial = serial;
+    if (self.cursor_device == null) if (self.cursor_manager) |manager| {
+        self.cursor_device = c.wp_cursor_shape_manager_v1_get_pointer(manager, self.pointer);
+    };
+    if (self.cursor_device) |device| c.wp_cursor_shape_device_v1_set_shape(device, serial, c.WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+    self.pointer_hidden = false;
     self.pointer_last = null;
     self.pointer_x = @as(f64, @floatFromInt(x)) / 256;
     self.pointer_y = @as(f64, @floatFromInt(y)) / 256;
@@ -973,13 +1249,16 @@ fn pointerEnter(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: ?*c.wl_surface,
 fn pointerLeave(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: ?*c.wl_surface) callconv(.c) void {
     const self = appFrom(data);
     self.pointer_inside = false;
+    self.pointer_hidden = false;
     self.pointer_buttons = 0;
     self.link_click = false;
+    self.paste_click = null;
     self.pointer_last = null;
     self.axes = @splat(0);
 }
 fn pointerMotion(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, x: c.wl_fixed_t, y: c.wl_fixed_t) callconv(.c) void {
     const self = appFrom(data);
+    self.showPointer();
     self.pointer_x = @as(f64, @floatFromInt(x)) / 256;
     self.pointer_y = @as(f64, @floatFromInt(y)) / 256;
     const button: u8 = if (self.pointer_buttons & 1 != 0) 0 else if (self.pointer_buttons & 2 != 0) 1 else if (self.pointer_buttons & 4 != 0) 2 else 3;
@@ -997,12 +1276,28 @@ fn pointerButton(data: ?*anyopaque, _: ?*c.wl_pointer, serial: u32, _: u32, butt
     if (pressed) self.clipboard.serial = serial;
     const bit = @as(u8, 1) << @intCast(number);
     if (pressed) self.pointer_buttons |= bit else self.pointer_buttons &= ~bit;
-    if (number == 0) {
+    if (!pressed and self.paste_click != null and self.paste_click.? == number) {
+        self.paste_click = null;
+        return;
+    }
+    const link_button: ?u8 = switch (self.settings.mouse.link_button) {
+        .none => null,
+        .left => 0,
+        .middle => 1,
+        .right => 2,
+    };
+    const paste_button: ?u8 = switch (self.settings.mouse.paste_button) {
+        .none => null,
+        .left => 0,
+        .middle => 1,
+        .right => 2,
+    };
+    if (link_button != null and number == link_button.?) {
         if (!pressed and self.link_click) {
             self.link_click = false;
             return;
         }
-        if (pressed and self.modifiers().control) {
+        if (pressed and (self.settings.mouse.link_modifier == .none or Config.modifierHeld(self.settings.mouse.link_modifier, self.modifiers()))) {
             const match = self.linkAtPointer() catch null;
             if (match) |value| {
                 defer self.allocator.free(value.uri);
@@ -1012,8 +1307,9 @@ fn pointerButton(data: ?*anyopaque, _: ?*c.wl_pointer, serial: u32, _: u32, butt
             }
         }
     }
-    if (number == 1 and pressed and (self.session.modes.mouse_tracking == 0 or self.modifiers().shift)) {
-        self.clipboard.request(true) catch |err| {
+    if (paste_button != null and number == paste_button.? and pressed and (self.session.modes.mouse_tracking == 0 or Config.modifierHeld(self.settings.mouse.reporting_bypass, self.modifiers()))) {
+        self.paste_click = number;
+        self.clipboard.request(self.settings.mouse.paste_primary) catch |err| {
             self.failure = err;
         };
     } else sendPointer(self, if (pressed) .press else .release, number);
@@ -1027,7 +1323,7 @@ fn pointerAxis(data: ?*anyopaque, pointer: ?*c.wl_pointer, _: u32, axis: u32, va
 fn pointerFrame(data: ?*anyopaque, _: ?*c.wl_pointer) callconv(.c) void {
     const self = appFrom(data);
     for (0..2) |axis| {
-        self.axes[axis] += if (self.axis_discrete[axis] != 0) @as(f64, @floatFromInt(self.axis_discrete[axis])) else self.axis_values[axis];
+        self.axes[axis] += (if (self.axis_discrete[axis] != 0) @as(f64, @floatFromInt(self.axis_discrete[axis])) else self.axis_values[axis]) * self.settings.mouse.wheel_multiplier;
         const steps: i32 = @intFromFloat(std.math.clamp(@trunc(self.axes[axis]), -128, 128));
         self.axes[axis] -= @as(f64, @floatFromInt(steps));
         for (0..@intCast(@abs(steps))) |_| sendPointer(self, .wheel, if (axis == 0) (if (steps < 0) 64 else 65) else (if (steps < 0) 66 else 67));
@@ -1280,4 +1576,136 @@ test "benchmark keyboard handler to PTY during continuous output" {
     std.mem.sort(i64, &samples, {}, std.sort.asc(i64));
     try t.expect(app.screen.revision > 1000); // the producer actually ran
     std.debug.print("\nvertex benchmark: Wayland key handler -> PTY write during continuous output; p50={d}us p95={d}us p99={d}us (excludes compositor/app/network latency)\n", .{ @divTrunc(samples[100], 1000), @divTrunc(samples[190], 1000), @divTrunc(samples[198], 1000) });
+}
+
+test "local shortcuts consume repeats and releases without leaking Kitty events" {
+    const t = std.testing;
+    var app: App = .{
+        .allocator = t.allocator,
+        .renderer = try Renderer.init(t.allocator),
+        .screen = undefined,
+        .session = try vt.Session.init(t.allocator, 2, 10),
+        .focused = true,
+    };
+    app.screen = app.session.activeScreen();
+    app.screen_ready = true;
+    defer app.deinit();
+    app.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbFailed;
+    var names = std.mem.zeroes(c.xkb_rule_names);
+    names.layout = "us";
+    app.keymap = c.xkb_keymap_new_from_names(app.xkb_context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbFailed;
+    app.key_state = c.xkb_state_new(app.keymap) orelse return error.XkbFailed;
+    const control = c.xkb_keymap_mod_get_index(app.keymap, c.XKB_MOD_NAME_CTRL);
+    _ = c.xkb_state_update_mask(app.key_state, @as(u32, 1) << @intCast(control), 0, 0, 0, 0, 0);
+    const key = c.xkb_keymap_key_by_name(app.keymap, "FK05");
+    var parser = vt.Parser.init();
+    parser.feed("\x1b[>31u", &app.session);
+    app.settings.keyboard.bindings = &.{.{ .key = "F5", .mods = "Control", .action = .send_text, .text = "local" }};
+    _ = try app.sendKey(key, .press);
+    _ = try app.sendKey(key, .repeat);
+    // A config reload while held must not leak the consumed release either.
+    app.settings.keyboard.bindings = &.{};
+    _ = try app.sendKey(key, .release);
+    try t.expectEqualStrings("local", app.pending.items);
+    app.pending.clearRetainingCapacity();
+    app.settings.keyboard.bindings = &.{.{ .key = "F5", .mods = "Control", .action = .none }};
+    _ = try app.sendKey(key, .press);
+    _ = try app.sendKey(key, .release);
+    try t.expect(std.mem.indexOf(u8, app.pending.items, ":3") != null);
+    try t.expect(app.pressed[key] == null and app.consumed_keys[key] == null);
+}
+
+test "reload preserves the PTY and existing content and rolls back invalid snapshots" {
+    const t = std.testing;
+    var filename = "/tmp/vertex-reload-test-XXXXXX".*;
+    const fd = c.mkstemp(&filename);
+    if (fd < 0) return error.TempFileFailed;
+    defer _ = c.close(fd);
+    defer _ = c.unlink(&filename);
+    const initial = "font.size=12\ncolors.background='#112233'\n";
+    try t.expectEqual(@as(isize, initial.len), c.write(fd, initial, initial.len));
+    const snapshot = try Config.loadAt(t.allocator, &filename, true, false);
+    var app: App = .{
+        .allocator = t.allocator,
+        .snapshot = snapshot,
+        .settings = snapshot.value,
+        .renderer = try configuredRenderer(t.allocator, snapshot.value.font),
+        .screen = undefined,
+        .session = try vt.Session.init(t.allocator, 24, 80),
+        .width = 800,
+        .height = 600,
+        .damage = Renderer.Damage.init(t.allocator),
+    };
+    app.screen = app.session.activeScreen();
+    app.screen_ready = true;
+    defer app.deinit();
+    app.pty = try Pty.spawn(t.allocator, &.{ "/bin/sh", "-c", "read line" }, 24, 80);
+    const pid = app.pty.?.pid;
+    var parser = vt.Parser.init();
+    parser.feed("persist", &app.session);
+    const next = "font.size=14\nfont.ligatures=true\nwindow.padding.left=11\ncolors.background='#aabbcc'\nterminal.renderer='cpu'\n";
+    try t.expectEqual(@as(c_int, 0), c.ftruncate(fd, 0));
+    try t.expectEqual(@as(c_long, 0), c.lseek(fd, 0, c.SEEK_SET));
+    try t.expectEqual(@as(isize, next.len), c.write(fd, next, next.len));
+    try app.reload();
+    try t.expect(app.renderer.ligatures);
+    try t.expectEqual(@as(f64, 14), app.settings.font.size);
+    try t.expectEqual(@as(u32, 0xaabbcc), app.session.theme.background);
+    try t.expectEqual(@as(u21, 'p'), app.screen.getCell(0, 0).?.codepoint);
+    try t.expectEqual(pid, app.pty.?.pid);
+    try t.expectEqual(Gpu.Mode.auto, app.mode);
+    for ([_][]const u8{ "font.size=1", "font.cell_width_offset=-256", "general.import=['missing/nested/theme.toml']" }) |invalid| {
+        try t.expectEqual(@as(c_int, 0), c.ftruncate(fd, 0));
+        try t.expectEqual(@as(c_long, 0), c.lseek(fd, 0, c.SEEK_SET));
+        try t.expectEqual(@as(isize, @intCast(invalid.len)), c.write(fd, invalid.ptr, invalid.len));
+        if (app.reload()) |_| return error.ExpectedRejectedReload else |_| {}
+        try t.expectEqual(@as(f64, 14), app.settings.font.size);
+        try t.expectEqual(@as(u32, 0xaabbcc), app.renderer.theme.background);
+        try t.expectEqual(pid, app.pty.?.pid);
+        try t.expect((try app.pty.?.pollExit()) == null);
+    }
+}
+
+test "padding offsets mouse pixels hit tests and cursor focus settings" {
+    const t = std.testing;
+    var app: App = .{
+        .allocator = t.allocator,
+        .renderer = try Renderer.init(t.allocator),
+        .screen = undefined,
+        .session = try vt.Session.init(t.allocator, 2, 30),
+        .content_x = 13,
+        .content_y = 17,
+    };
+    app.screen = app.session.activeScreen();
+    app.screen_ready = true;
+    defer app.deinit();
+    app.session.modes.mouse_tracking = 1003;
+    app.session.modes.mouse_pixels = true;
+    pointerEnter(&app, null, 1, null, 14 * 256, 18 * 256);
+    sendPointer(&app, .press, 0);
+    try t.expectEqualStrings("\x1b[<0;2;2M", app.pending.items);
+    app.pending.clearRetainingCapacity();
+    pointerMotion(&app, null, 0, 12 * 256, 18 * 256);
+    try t.expectEqual(@as(usize, 0), app.pending.items.len);
+    app.settings.window.opacity = 0.8;
+    app.settings.window.unfocused_opacity = 0.3;
+    app.settings.cursor.shape = .bar;
+    app.applyPresentation();
+    try t.expectEqual(@as(f64, 0.3), app.renderer.background_opacity);
+    keyboardEnter(&app, null, 1, null, null);
+    try t.expectEqual(@as(f64, 0.8), app.renderer.background_opacity);
+    try t.expectEqual(@as(@FieldType(vt.Cursor, "shape"), .bar), app.renderer.cursor_shape);
+    try t.expect(!app.renderer.cursor_hollow);
+}
+
+test "empty window configure states are valid and fullscreen follows the compositor" {
+    var app: App = .{ .allocator = std.testing.allocator, .renderer = undefined, .screen = undefined, .fullscreen = true };
+    var states = std.mem.zeroes(c.wl_array);
+    toplevelConfigure(&app, null, 800, 600, &states);
+    try std.testing.expect(!app.fullscreen);
+    var values = [_]u32{c.XDG_TOPLEVEL_STATE_FULLSCREEN};
+    states.data = &values;
+    states.size = @sizeOf(@TypeOf(values));
+    toplevelConfigure(&app, null, 800, 600, &states);
+    try std.testing.expect(app.fullscreen);
 }

@@ -10,6 +10,7 @@ cursor: ?vt.Cursor = null,
 width: usize = 0,
 height: usize = 0,
 invalid: bool = true,
+origin_y: usize = 0,
 full: bool = true,
 
 pub fn init(allocator: std.mem.Allocator) Damage {
@@ -53,8 +54,8 @@ pub fn prepare(self: *Damage, screen: *const vt.Screen, width: usize, height: us
             }
             const first = row;
             while (row < self.rows.len and self.rows[row]) : (row += 1) {}
-            const y = @min(height, first * cell_height);
-            const bottom = @min(height, row * cell_height);
+            const y = @min(height, self.origin_y + first * cell_height);
+            const bottom = @min(height, self.origin_y + row * cell_height);
             if (bottom > y) try self.rects.append(self.allocator, .{ .x = 0, .y = @intCast(y), .width = @intCast(width), .height = @intCast(bottom - y) });
         }
     }

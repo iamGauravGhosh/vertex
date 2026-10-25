@@ -175,3 +175,22 @@ test "horizontal-margin streams are invariant at every byte split" {
         try t.expectEqualDeep(expected.screen.cursor, session.screen.cursor);
     }
 }
+
+test "configured palette queries and bounded dynamic titles reflect session state" {
+    var session = try vt.Session.init(std.testing.allocator, 2, 8);
+    defer session.deinit();
+    session.theme.background = 0x123456;
+    session.theme.foreground = 0xabcdef;
+    session.theme.normal[1] = 0xaabbcc;
+    var parser = vt.Parser.init();
+    parser.feed("\x1b]10;?\x07\x1b]11;?\x07\x1b]4;1;?\x07\x1b]2;editor - file.zig\x07", &session);
+    try std.testing.expect(std.mem.indexOf(u8, session.replies.items, "rgb:abab/cdcd/efef") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.replies.items, "rgb:1212/3434/5656") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.replies.items, "rgb:aaaa/bbbb/cccc") != null);
+    try std.testing.expect(session.title_changed);
+    try std.testing.expectEqualStrings("editor - file.zig", session.title[0..session.title_len]);
+    parser.feed("\x1b[5 q", &session);
+    try std.testing.expect(!session.screen.cursor.configured and session.screen.cursor.blinking);
+    parser.feed("\x1b[0 q", &session);
+    try std.testing.expect(session.screen.cursor.configured);
+}

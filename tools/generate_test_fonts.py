@@ -94,6 +94,7 @@ for proportional in (False, True):
     if proportional:
         addOpenTypeFeaturesFromString(builder.font, '''
             feature liga { sub i i by wide; } liga;
+            feature calt { sub W W by wide; } calt;
             markClass acute <anchor 0 0> @TOP;
             feature mark { pos base A <anchor 300 900> mark @TOP; } mark;
         ''')

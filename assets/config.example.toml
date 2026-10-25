@@ -1,0 +1,80 @@
+# Save as ~/.config/vertex/config.toml. See docs/configuration.md.
+[general]
+import = []
+live_reload = true
+
+[font]
+family = "monospace"
+size = 12.0
+ligatures = false
+# bold_family = "monospace:weight=bold"
+# italic_family = "monospace:slant=italic"
+# bold_italic_family = "monospace:weight=bold:slant=italic"
+features = [] # e.g. ["ss01=1", "cv02=1"]
+cell_width_offset = 0
+cell_height_offset = 0
+glyph_offset_x = 0
+glyph_offset_y = 0
+
+[colors]
+foreground = "#d8dee9"
+background = "#15171a"
+normal = ["#2e3440", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#88c0d0", "#e5e9f0"]
+bright = ["#4c566a", "#d08770", "#b5d99c", "#ffdf9e", "#81a1c1", "#c6a0c9", "#9dd9e5", "#ffffff"]
+# cursor = "#d8dee9"
+# cursor_text = "#15171a"
+dim_factor = 0.5
+bold_is_bright = false
+# [colors.indexed]
+# "16" = "#ff8800"
+
+[window]
+dynamic_padding = false
+opacity = 1.0
+# unfocused_opacity = 0.85
+title = "Vertex"
+dynamic_title = true
+app_id = "vertex"
+columns = 80
+rows = 24
+startup_mode = "windowed" # windowed, maximized, fullscreen
+decorations = "none" # none, server (if compositor supports it)
+[window.padding]
+left = 0
+right = 0
+top = 0
+bottom = 0
+
+[cursor]
+shape = "block" # block, bar, underline
+thickness = 2
+blinking = false
+blink_interval = 500 # milliseconds
+unfocused_hollow = true
+
+# Supplying bindings replaces the default array. Include defaults you want to keep.
+[[keyboard.bindings]]
+key = "v"
+mods = "Control|Shift"
+action = "paste"
+[[keyboard.bindings]]
+key = "Insert"
+mods = "Shift"
+action = "paste_primary"
+
+[mouse]
+paste_button = "middle" # none, left, middle, right
+paste_primary = true
+link_button = "left"
+link_modifier = "control" # none, shift, control, alt, super
+reporting_bypass = "shift"
+wheel_multiplier = 1.0
+hide_when_typing = false
+
+[terminal]
+shell = [] # empty selects $SHELL, account shell, or /bin/sh, with -i
+# working_directory = "~/Projects"
+bidi = "off"
+renderer = "auto" # auto, gpu, cpu
+[terminal.env]
+# EDITOR = "nvim"

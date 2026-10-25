@@ -47,10 +47,15 @@ Each row caches shaped glyph IDs, font identity, positions, source cell spans,
 and a content fingerprint. Unicode 15.1 graphemes occupy one or two columns;
 continuation cells are never shaped independently. Fontconfig supplies fallback
 faces for complete clusters in stable Fontconfig order, with separate sorted sets
-for regular, bold, italic, and bold-italic styles. The GUI loads font settings
-from the Vertex config and applies environment overrides at startup. Explicit
+for regular, bold, italic, and bold-italic styles. The GUI owns a typed TOML configuration snapshot and applies environment
+overrides. Configuration files and imports are watched through filtered directory
+inotify watches in the main poll loop. Reload prepares a replacement renderer,
+watch set, and grid storage before swapping snapshots; rejected candidates retain
+the current renderer, settings, and PTY. Optional ligatures default off; configured
+HarfBuzz features never disable required complex-script shaping. Explicit
 renderer initializers ignore configuration and the environment; `initWithOptions`
-accepts a family, point size, and optional fixture directory. The default is
+accepts families, point size, ligature/features/spacing options, and an optional
+fixture directory. The default is
 `monospace` at 12 pt, sized at 96 logical DPI with FreeType. Monospace
 and proportional faces both use the primary font's `M` advance for cell width,
 with a positive metrics fallback when `M` is unavailable. HarfBuzz shapes
@@ -135,7 +140,13 @@ swap-with-damage is used when available, with bottom-left pixel rectangles;
 otherwise presentation uses ordinary swaps. A context or presentation failure
 in auto mode switches permanently to CPU after destroying EGL resources.
 
-The CPU backend keeps a canonical XRGB8888 image and two shared-memory buffers.
+Both backends retain premultiplied alpha. The default background and padding
+use configured opacity while text and explicit cell backgrounds remain opaque.
+A shared padded viewport translates drawing, image clips, IME rectangles, damage,
+and pointer coordinates. Session-owned theme colors also answer color queries.
+Cursor blink deadlines wake the poll loop without repainting idle windows.
+
+The CPU backend keeps a canonical ARGB8888 image and two shared-memory buffers.
 Each buffer accumulates its own pending rows, including while busy, and catches
 up from the canonical image only after release. Resize retires incompatible
 buffers until the compositor releases them. Initialization, resize, scale, and

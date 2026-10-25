@@ -1,4 +1,0 @@
-# Save as ~/.config/vertex/config (or $XDG_CONFIG_HOME/vertex/config).
-# Font size is in points at 96 logical DPI. Restart Vertex after changes.
-font_family = JetBrainsMonoNL Nerd Font
-font_size = 13

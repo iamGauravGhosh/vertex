@@ -4,7 +4,7 @@ const c = @import("c");
 const Renderer = @import("root.zig");
 const Atlas = Renderer.Atlas;
 const Gpu = @This();
-const Vertex = extern struct { x: f32, y: f32, u: f32, v: f32, r: f32, g: f32, b: f32 };
+const Vertex = extern struct { x: f32, y: f32, u: f32, v: f32, r: f32, g: f32, b: f32, a: f32 };
 const SwapDamage = *const fn (c.EGLDisplay, c.EGLSurface, [*c]const c.EGLint, c.EGLint) callconv(.c) c.EGLBoolean;
 const ImageTexture = struct { texture: c.GLuint = 0, identity: u64 = 0, bytes: usize = 0, used: u64 = 0 };
 
@@ -64,7 +64,7 @@ fn create(allocator: std.mem.Allocator, wayland: ?*c.wl_display, surface: ?*c.wl
         c.EGL_RED_SIZE,        8,
         c.EGL_GREEN_SIZE,      8,
         c.EGL_BLUE_SIZE,       8,
-        c.EGL_ALPHA_SIZE,      0,
+        c.EGL_ALPHA_SIZE,      8,
         c.EGL_DEPTH_SIZE,      0,
         c.EGL_STENCIL_SIZE,    0,
         c.EGL_NONE,
@@ -130,13 +130,13 @@ fn initGl(self: *Gpu) !void {
         \\#version 300 es
         \\layout(location=0) in vec2 position;
         \\layout(location=1) in vec2 texcoord;
-        \\layout(location=2) in vec3 color;
+        \\layout(location=2) in vec4 color;
         \\uniform vec2 viewport;
         \\out vec2 uv;
-        \\out vec3 rgb;
+        \\out vec4 rgba;
         \\void main() {
         \\  gl_Position = vec4(position.x / viewport.x * 2.0 - 1.0, 1.0 - position.y / viewport.y * 2.0, 0, 1);
-        \\  uv = texcoord; rgb = color;
+        \\  uv = texcoord; rgba = color;
         \\}
     );
     defer c.glDeleteShader(vs);
@@ -146,9 +146,9 @@ fn initGl(self: *Gpu) !void {
         \\uniform sampler2D atlas;
         \\uniform bool masked;
         \\in vec2 uv;
-        \\in vec3 rgb;
+        \\in vec4 rgba;
         \\out vec4 output_color;
-        \\void main() { output_color = masked ? texture(atlas, uv) * vec4(rgb, 1.0) : vec4(rgb, 1.0); }
+        \\void main() { output_color = masked ? texture(atlas, uv) * rgba : rgba; }
     );
     defer c.glDeleteShader(fs);
     self.program = c.glCreateProgram();
@@ -169,7 +169,7 @@ fn initGl(self: *Gpu) !void {
     c.glEnableVertexAttribArray(2);
     c.glVertexAttribPointer(0, 2, c.GL_FLOAT, c.GL_FALSE, @sizeOf(Vertex), null);
     c.glVertexAttribPointer(1, 2, c.GL_FLOAT, c.GL_FALSE, @sizeOf(Vertex), @ptrFromInt(2 * @sizeOf(f32)));
-    c.glVertexAttribPointer(2, 3, c.GL_FLOAT, c.GL_FALSE, @sizeOf(Vertex), @ptrFromInt(4 * @sizeOf(f32)));
+    c.glVertexAttribPointer(2, 4, c.GL_FLOAT, c.GL_FALSE, @sizeOf(Vertex), @ptrFromInt(4 * @sizeOf(f32)));
     c.glGenTextures(Atlas.page_count, &self.textures);
     c.glGenTextures(1, &self.color_texture);
     c.glBindTexture(c.GL_TEXTURE_2D, self.color_texture);
@@ -214,7 +214,7 @@ pub fn render(self: *Gpu, renderer: *Renderer, screen: *const @import("../termin
     try self.makeCurrent();
     c.glBindFramebuffer(c.GL_FRAMEBUFFER, self.fbo);
     c.glViewport(0, 0, @intCast(self.width), @intCast(self.height));
-    if (damage.full) try self.fill(.{ .x = 0, .y = 0, .width = @intCast(self.width), .height = @intCast(self.height) }, Renderer.default_background);
+    if (damage.full) try self.fill(.{ .x = 0, .y = 0, .width = @intCast(self.width), .height = @intCast(self.height) }, renderer.background());
     try renderer.paint(screen, damage.rows, self);
     try checkGl();
 }
@@ -244,6 +244,7 @@ pub fn flush(self: *Gpu) !void {
     c.glBindVertexArray(self.vao);
     c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
     c.glBufferData(c.GL_ARRAY_BUFFER, @intCast(self.vertices.items.len * @sizeOf(Vertex)), self.vertices.items.ptr, c.GL_STREAM_DRAW);
+    if (self.masked) c.glEnable(c.GL_BLEND) else c.glDisable(c.GL_BLEND);
     c.glDrawArrays(c.GL_TRIANGLES, 0, @intCast(self.vertices.items.len));
     self.vertices.clearRetainingCapacity();
     try checkGl();
@@ -261,10 +262,11 @@ fn quad(self: *Gpu, rect: Renderer.Rect, uv: [4]f32, rgb: u32, masked: bool, pag
     const r = @as(f32, @floatFromInt((rgb >> 16) & 255)) / 255;
     const g = @as(f32, @floatFromInt((rgb >> 8) & 255)) / 255;
     const b = @as(f32, @floatFromInt(rgb & 255)) / 255;
-    const a: Vertex = .{ .x = x, .y = y, .u = uv[0], .v = uv[1], .r = r, .g = g, .b = b };
-    const tr: Vertex = .{ .x = right, .y = y, .u = uv[2], .v = uv[1], .r = r, .g = g, .b = b };
-    const br: Vertex = .{ .x = right, .y = bottom, .u = uv[2], .v = uv[3], .r = r, .g = g, .b = b };
-    const bl: Vertex = .{ .x = x, .y = bottom, .u = uv[0], .v = uv[3], .r = r, .g = g, .b = b };
+    const alpha = @as(f32, @floatFromInt(rgb >> 24)) / 255;
+    const a: Vertex = .{ .x = x, .y = y, .u = uv[0], .v = uv[1], .r = r, .g = g, .b = b, .a = alpha };
+    const tr: Vertex = .{ .x = right, .y = y, .u = uv[2], .v = uv[1], .r = r, .g = g, .b = b, .a = alpha };
+    const br: Vertex = .{ .x = right, .y = bottom, .u = uv[2], .v = uv[3], .r = r, .g = g, .b = b, .a = alpha };
+    const bl: Vertex = .{ .x = x, .y = bottom, .u = uv[0], .v = uv[3], .r = r, .g = g, .b = b, .a = alpha };
     try self.vertices.appendSlice(self.allocator, &.{ a, tr, br, a, br, bl });
 }
 fn bounds(self: *Gpu) Renderer.Rect {
@@ -281,7 +283,7 @@ pub fn mask(self: *Gpu, atlas: *Atlas, region: Atlas.Region, x: i32, y: i32, cli
     const r = Renderer.intersect(Renderer.intersect(.{ .x = x, .y = y, .width = @intCast(region.width), .height = @intCast(region.height) }, clip), self.bounds());
     const ax = @as(f32, @floatFromInt(@as(i32, @intCast(region.x)) + r.x - x));
     const ay = @as(f32, @floatFromInt(@as(i32, @intCast(region.y)) + r.y - y));
-    try self.quad(r, .{ ax / Atlas.size, ay / Atlas.size, (ax + @as(f32, @floatFromInt(r.width))) / Atlas.size, (ay + @as(f32, @floatFromInt(r.height))) / Atlas.size }, if (region.color) 0xffffff else rgb, true, region.page);
+    try self.quad(r, .{ ax / Atlas.size, ay / Atlas.size, (ax + @as(f32, @floatFromInt(r.width))) / Atlas.size, (ay + @as(f32, @floatFromInt(r.height))) / Atlas.size }, if (region.color) 0xffffffff else rgb, true, region.page);
 }
 pub fn upload(self: *Gpu, atlas: *Atlas, region: Atlas.Region) !void {
     // A CPU painter may have populated this page since our last draw. A partial
@@ -355,8 +357,9 @@ pub fn image(self: *Gpu, value: Renderer.Image) !void {
     const t = (@as(f32, @floatFromInt(s.y)) + @as(f32, @floatFromInt(r.y - d.y)) * sh / dh) / bh;
     const right = (@as(f32, @floatFromInt(s.x)) + @as(f32, @floatFromInt(r.x + r.width - d.x)) * sw / dw) / bw;
     const bottom = (@as(f32, @floatFromInt(s.y)) + @as(f32, @floatFromInt(r.y + r.height - d.y)) * sh / dh) / bh;
-    try self.quad(r, .{ l, t, right, bottom }, 0xffffff, true, 0);
+    try self.quad(r, .{ l, t, right, bottom }, 0xffffffff, true, 0);
     // Image quads use their own texture, rather than a glyph atlas page.
+    c.glEnable(c.GL_BLEND);
     c.glUseProgram(self.program);
     c.glUniform2f(self.viewport_uniform, @floatFromInt(self.width), @floatFromInt(self.height));
     c.glUniform1i(self.masked_uniform, 1);
@@ -370,7 +373,12 @@ pub fn image(self: *Gpu, value: Renderer.Image) !void {
     try checkGl();
 }
 
-/// Upload existing CPU pages when switching renderers or initializing a new context.
+/// A new renderer can reuse atlas revision numbers; its textures must be uploaded.
+pub fn invalidateAtlas(self: *Gpu) void {
+    self.texture_ready = @splat(false);
+    self.atlas_revisions = @splat(std.math.maxInt(u64));
+}
+/// Upload existing CPU pages when initializing or switching to a GPU context.
 pub fn syncAtlas(self: *Gpu, atlas: *Atlas) !void {
     for (&atlas.pages, 0..) |*page, i| {
         if (page.pixels.len == 0) continue;

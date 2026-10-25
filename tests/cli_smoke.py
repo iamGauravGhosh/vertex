@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
+import tempfile
+import tomllib
 
 
 EXECUTABLE = Path(sys.argv.pop(1)).resolve()
@@ -48,6 +50,26 @@ class CliSmoke(unittest.TestCase):
             b"Wayland" in result.stderr or b"GuiDisabled" in result.stderr,
             result.stderr,
         )
+
+    def test_configuration_defaults_validation_and_explicit_path(self):
+        result = invoke("config", "defaults")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        defaults = tomllib.loads(result.stdout.decode())
+        self.assertIs(defaults["font"]["ligatures"], False)
+        with tempfile.TemporaryDirectory(prefix="vertex-cli-config-") as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text("font.ligatures = true\nwindow.opacity = 0.7\n")
+            result = invoke("config", "check", "--config", str(path))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            path.write_text("font.ligatures = 'invalid'\n")
+            result = invoke("config", "check", "--config", str(path))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"font.ligatures", result.stderr)
+            result = invoke("--config", str(path), "--", "/bin/sh", "-c", "exit 99")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(b"font.ligatures", result.stderr)
+            result = invoke("config", "check", "--config", str(path.parent / "missing.toml"))
+            self.assertEqual(result.returncode, 1)
 
     def test_piped_colors_unicode_and_controls(self):
         result = invoke("parse", data="\x1b[31mAé\x1b[0m\n".encode())
@@ -138,7 +160,8 @@ class CliSmoke(unittest.TestCase):
         self.assertEqual(
             (installed / "LICENSE").read_bytes(), (SOURCE_ROOT / "LICENSE").read_bytes()
         )
-        self.assertEqual({p.name for p in installed.iterdir()}, {"LICENSE"})
+        self.assertEqual({p.name for p in installed.iterdir()}, {"LICENSE", "stb_image-LICENSE", "tomlc17-LICENSE"})
+        self.assertEqual((installed / "tomlc17-LICENSE").read_bytes(), (SOURCE_ROOT / "vendor/tomlc17/LICENSE").read_bytes())
 
 
 if __name__ == "__main__":

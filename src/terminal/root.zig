@@ -11,6 +11,7 @@ pub const Cell = Screen.Cell;
 pub const Color = Screen.Color;
 pub const Style = Screen.Style;
 pub const Cursor = Screen.Cursor;
+pub const Theme = @import("Colors.zig").Theme;
 pub const Event = Parser.Event;
 pub const Events = Parser.Events;
 pub const Parameter = Parser.Parameter;

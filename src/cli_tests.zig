@@ -120,3 +120,19 @@ test "CLI streaming mode exposes escaped OSC and APC lifecycles" {
     );
     for (output.buffered()) |byte| try testing.expect(byte == '\n' or (byte >= 0x20 and byte <= 0x7e));
 }
+
+test "configuration launch arguments and default TOML are explicit" {
+    const launch = try cli.launch(&.{ "--config", "/tmp/custom.toml", "--", "/bin/sh", "-l" });
+    try testing.expectEqualStrings("/tmp/custom.toml", launch.config.?);
+    try testing.expectEqualStrings("/bin/sh", launch.command[0]);
+    try testing.expectEqual(@as(usize, 0), (try cli.launch(&.{ "--config", "theme.toml" })).command.len);
+    try testing.expectError(error.InvalidArguments, cli.launch(&.{ "--config", "theme.toml", "parse" }));
+    try testing.expectError(error.InvalidArguments, cli.launch(&.{"--"}));
+    var input = std.Io.Reader.fixed("unread");
+    var bytes: [8192]u8 = undefined;
+    var output = std.Io.Writer.fixed(&bytes);
+    var diagnostic = std.Io.Writer.fixed(&.{});
+    try testing.expectEqual(@as(u8, 0), try cli.run(&.{ "config", "defaults" }, &input, &output, &diagnostic));
+    try testing.expect(std.mem.indexOf(u8, output.buffered(), "ligatures = false") != null);
+    try testing.expectEqual(@as(usize, 0), input.seek);
+}

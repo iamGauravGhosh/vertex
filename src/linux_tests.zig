@@ -12,6 +12,7 @@ const linux = @import("platform/linux.zig");
 test {
     _ = linux;
     _ = @import("font_tests.zig");
+    _ = @import("config_tests.zig");
     _ = @import("performance_tests.zig");
 }
 
@@ -274,7 +275,7 @@ test "renderer draws styled cells, cursor, missing glyphs, and clips to the grid
     try renderer.draw(&screen, pixels[1 .. pixels.len - 1], width, height);
     try t.expectEqual(@as(u32, 0xdeadbeef), pixels[0]);
     try t.expectEqual(@as(u32, 0xdeadbeef), pixels[pixels.len - 1]);
-    for (0..height) |y| for (0..renderer.cell_width) |x| try t.expectEqual(Renderer.color(.{ .indexed = 1 }, 0), pixels[1 + y * width + x]);
+    for (0..height) |y| for (0..renderer.cell_width) |x| try t.expectEqual(0xff000000 | Renderer.color(.{ .indexed = 1 }, 0), pixels[1 + y * width + x]);
     var changed: usize = 0;
     for (pixels[1 .. pixels.len - 1]) |pixel| if (pixel == Renderer.default_foreground) {
         changed += 1;
@@ -303,6 +304,7 @@ test "optional Wayland window starts a child and exits with its status" {
 test "shaping forms ligatures, preserves columns and style boundaries, and caches rows" {
     var renderer = try Renderer.initFont(t.allocator, "DejaVu Sans");
     defer renderer.deinit();
+    renderer.setLigatures(true);
     var screen = try vt.Screen.init(t.allocator, 1, 4);
     defer screen.deinit();
     var parser = vt.Parser.init();
@@ -382,6 +384,7 @@ fn expectGlyphColumns(renderer: *Renderer, screen: *const vt.Screen, row: usize,
 test "proportional glyphs fit cells while ligatures combining marks and wide cells retain their spans" {
     var renderer = try Renderer.initFontDirectory(t.allocator, "Vertex Test Proportional", "tests/fonts");
     defer renderer.deinit();
+    renderer.setLigatures(true);
     var screen = try vt.Screen.init(t.allocator, 1, 10);
     defer screen.deinit();
     var parser = vt.Parser.init();
@@ -618,8 +621,8 @@ test "deterministic fallback font renders color glyphs in CPU and GPU" {
     var red = false;
     var green = false;
     for (pixels) |pixel| {
-        red = red or pixel == 0xff0000;
-        green = green or pixel == 0x00ff00;
+        red = red or pixel == 0xffff0000;
+        green = green or pixel == 0xff00ff00;
     }
     try t.expect(red and green);
     var gpu = @import("renderer/Gpu.zig").initHeadless(t.allocator, width, height) catch |err| {
@@ -649,8 +652,8 @@ test "true color channels reach the framebuffer without palette quantization" {
     var foreground = false;
     var background = false;
     for (pixels) |pixel| {
-        foreground = foreground or pixel == 0x1181fd;
-        background = background or pixel == 0x030507;
+        foreground = foreground or pixel == 0xff1181fd;
+        background = background or pixel == 0xff030507;
     }
     try t.expect(foreground and background);
 }

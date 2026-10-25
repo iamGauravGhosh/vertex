@@ -1,0 +1,21 @@
+// Niri >= 26.04. Add this window-rule to your existing config.kdl.
+// https://niri-wm.github.io/niri/Configuration:-Window-Rules.html
+// Set Vertex window.opacity below 1; keep compositor opacity at 1 for opaque text.
+window-rule {
+    match app-id="^vertex$"
+    geometry-corner-radius 12
+    clip-to-geometry true
+    draw-border-with-background false
+    border {
+        on
+        width 2
+        active-color "#81a1c1"
+        inactive-color "#4c566a"
+    }
+    shadow { on }
+    background-effect { blur true }
+}
+// Optional: merge `gaps 10` into your existing layout { } block.
+// Optional placement for a separate Vertex config with app_id="vertex-floating":
+// window-rule { match app-id="^vertex-floating$"; open-floating true; }
+// On Niri versions before 26.04 omit background-effect; blur needs compositor support.

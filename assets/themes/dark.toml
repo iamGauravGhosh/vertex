@@ -1,0 +1,6 @@
+# Import from config.toml with [general] import = ["themes/dark.toml"].
+[colors]
+foreground = "#d8dee9"
+background = "#15171a"
+normal = ["#2e3440", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#88c0d0", "#e5e9f0"]
+bright = ["#4c566a", "#d08770", "#b5d99c", "#ffdf9e", "#81a1c1", "#c6a0c9", "#9dd9e5", "#ffffff"]

@@ -1,0 +1,6 @@
+# Import from config.toml with [general] import = ["themes/light.toml"].
+[colors]
+foreground = "#343b58"
+background = "#f5f5f2"
+normal = ["#343b58", "#b73548", "#427642", "#947020", "#345f9a", "#85599b", "#2c7780", "#d9dde7"]
+bright = ["#66708c", "#cf4b5f", "#4f8c53", "#ab832a", "#4777b7", "#9c6db2", "#3e929c", "#ffffff"]

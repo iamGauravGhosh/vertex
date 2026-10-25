@@ -1,0 +1,4 @@
+Upstream: https://github.com/cktan/tomlc17
+Revision: 4987cf895df61f702d19e3481f34b032ab29ed3a
+License: MIT (see LICENSE)
+Unmodified src/tomlc17.c and src/tomlc17.h, vendored 2026-10-25.

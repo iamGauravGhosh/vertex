@@ -23,6 +23,10 @@ replies: std.ArrayList(u8) = .empty,
 failure: ?anyerror = null,
 strings: Strings = .{},
 graphics: GraphicsProtocol = .{},
+theme: Colors.Theme = .{},
+title: [4096]u8 = undefined,
+title_len: usize = 0,
+title_changed: bool = false,
 /// Set by the host before feeding bytes; monotonic milliseconds, no OS clock here.
 now_ms: i64 = 0,
 sync_deadline_ms: ?i64 = null,
@@ -54,6 +58,16 @@ pub fn deinit(self: *Session) void {
 }
 pub fn activeScreen(self: *Session) *Screen {
     return &self.screen;
+}
+pub fn setCursorDefaults(self: *Session, shape: @FieldType(Screen.Cursor, "shape"), blinking: bool) void {
+    for ([_]*Screen{ &self.screen, &self.other }) |screen| {
+        screen.default_cursor.shape = shape;
+        screen.default_cursor.blinking = blinking;
+        if (screen.cursor.configured) {
+            screen.cursor.shape = shape;
+            screen.cursor.blinking = blinking;
+        }
+    }
 }
 pub fn getModes(self: *const Session) Input.Modes {
     var modes = self.modes;
@@ -365,7 +379,15 @@ fn modeStatus(self: *const Session, mode: u16) u8 {
 fn osc(self: *Session, bytes: []const u8) !void {
     var parts = std.mem.splitScalar(u8, bytes, ';');
     const command = parts.next() orelse return;
-    if (std.mem.eql(u8, command, "8")) {
+    if (std.mem.eql(u8, command, "0") or std.mem.eql(u8, command, "2")) {
+        const title = parts.rest();
+        if (title.len >= self.title.len or !std.unicode.utf8ValidateSlice(title)) return;
+        for (title) |byte| if (byte < 0x20 or byte == 0x7f) return;
+        @memcpy(self.title[0..title.len], title);
+        self.title[title.len] = 0;
+        self.title_len = title.len;
+        self.title_changed = true;
+    } else if (std.mem.eql(u8, command, "8")) {
         const params = parts.next() orelse return;
         const uri = parts.rest();
         var id: []const u8 = "";
@@ -381,11 +403,11 @@ fn osc(self: *Session, bytes: []const u8) !void {
             if (std.mem.eql(u8, query, "?")) {
                 var buf: [96]u8 = undefined;
                 const prefix = try std.fmt.bufPrint(&buf, "4;{d}", .{n});
-                try self.colorReply(prefix, Colors.indexed(n));
+                try self.colorReply(prefix, self.theme.at(n));
             }
         }
     } else if ((std.mem.eql(u8, command, "10") or std.mem.eql(u8, command, "11")) and std.mem.eql(u8, parts.next() orelse "", "?")) {
-        try self.colorReply(command, if (command[1] == '0') Colors.foreground else Colors.background);
+        try self.colorReply(command, if (command[1] == '0') self.theme.foreground else self.theme.background);
     }
 }
 fn colorReply(self: *Session, command: []const u8, color: u32) !void {
@@ -418,11 +440,11 @@ fn status(self: *Session, bytes: []const u8) !void {
     } else if (std.mem.eql(u8, bytes, "s")) {
         try self.reply(try std.fmt.bufPrint(&buf, "\x1bP1$r{d};{d}s\x1b\\", .{ self.screen.scroll_left + 1, self.screen.scroll_right }));
     } else if (std.mem.eql(u8, bytes, " q")) {
-        const shape: u8 = switch (self.screen.cursor.shape) {
+        const shape: u8 = (@as(u8, switch (self.screen.cursor.shape) {
             .block => 2,
             .underline => 4,
             .bar => 6,
-        };
+        }) - @as(u8, @intFromBool(self.screen.cursor.blinking)));
         try self.reply(try std.fmt.bufPrint(&buf, "\x1bP1$r{d} q\x1b\\", .{shape}));
     } else try self.reply("\x1bP0$r\x1b\\");
 }

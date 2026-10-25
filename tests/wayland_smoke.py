@@ -29,10 +29,11 @@ def check_window(width, height, scale, renderer="gpu", fail_gpu=False, font=None
         root = Path(temporary)
         environment = os.environ.copy()
         environment.pop("WAYLAND_SOCKET", None)
-        environment.update(XDG_RUNTIME_DIR=temporary, WAYLAND_DISPLAY="vertex-test")
+        environment.update(XDG_RUNTIME_DIR=temporary, XDG_CONFIG_HOME=str(root / "config"), WAYLAND_DISPLAY="vertex-test")
         environment.pop("__EGL_VENDOR_LIBRARY_FILENAMES", None)
         environment.update(VERTEX_RENDERER=renderer, LIBGL_ALWAYS_SOFTWARE="1")
         environment.pop("VERTEX_FONT", None)
+        environment.pop("VERTEX_FONT_SIZE", None)
         if font is not None:
             environment["VERTEX_FONT"] = font
         with (root / "weston.log").open("w+") as compositor_log:
@@ -88,6 +89,28 @@ def check_window(width, height, scale, renderer="gpu", fail_gpu=False, font=None
                 )
                 assert protocol_result.returncode == 0, protocol_result.stderr.decode(errors="replace")
                 assert "passed" in protocol_report.read_text()
+                config = root / "config.toml"
+                theme = root / "theme.toml"
+                config.write_text(
+                    "[general]\nimport=['theme.toml']\n"
+                    "[window]\nopacity=0.65\napp_id='vertex-config-test'\n"
+                    "[terminal.env]\nVERTEX_CONFIG_PROBE='configured'\n"
+                )
+                theme.write_text("colors.background='#112233'\n")
+                config_report = root / "config-report.json"
+                config_result = subprocess.run(
+                    [str(EXECUTABLE), "--config", str(config), "--", sys.executable,
+                     str(Path(__file__).with_name("configuration_probe.py").resolve()),
+                     str(config), str(theme), str(config_report)],
+                    env=environment, capture_output=True, timeout=20, check=False,
+                )
+                config_trace = config_result.stderr.decode(errors="replace")
+                assert config_result.returncode == 0, config_trace
+                assert config_report.exists(), config_trace
+                assert 'set_app_id("vertex-config-test")' in config_trace, config_trace
+                assert 'set_title("Vertex configuration probe")' in config_trace, config_trace
+                assert "config reload rejected" in config_trace, config_trace
+                print(f"Wayland {renderer}: theme imports, atomic reload, padding resize and rejected edits passed")
                 # A disconnected compositor must also hang up and reap a shell
                 # that is still running, rather than leave a background session.
                 pid_file = root / "child-pid"

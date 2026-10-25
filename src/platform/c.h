@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/inotify.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
@@ -21,6 +23,9 @@
 #include "xdg-shell-client-protocol.h"
 #include "primary-selection-client-protocol.h"
 #include "text-input-client-protocol.h"
+#include "xdg-decoration-client-protocol.h"
+#include "cursor-shape-client-protocol.h"
+#include "tomlc17.h"
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-compose.h>
 #include <xkbcommon/xkbcommon-keysyms.h>

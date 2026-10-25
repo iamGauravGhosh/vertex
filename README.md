@@ -79,7 +79,9 @@ never overwritten; publish a new version tag for subsequent releases. No extra
 repository secrets are needed.
 
 Each release includes `vertex-<tag>-linux-x86_64.tar.gz` and its `.sha256` checksum.
-The archive contains `vertex`, `README.md`, and `LICENSE` in a matching directory.
+The archive contains `vertex`, `README.md`, `LICENSE`, dependency licenses,
+configuration examples, themes, compositor snippets, and documentation in a
+matching directory.
 The executable is built with Zig 0.17.0 in ReleaseSafe mode for a baseline x86_64
 CPU on Ubuntu 24.04. It needs a compatible Linux/glibc system, a Wayland compositor,
 Wayland client/EGL libraries, xkbcommon, FreeType, Fontconfig, HarfBuzz, FriBidi, EGL,
@@ -130,19 +132,39 @@ GPU rendering, then permanently switches to CPU for the session if graphics
 initialization or rendering fails. `gpu` reports graphics failures directly;
 `cpu` bypasses EGL initialization. For example: `VERTEX_RENDERER=cpu zig-out/bin/vertex`.
 
-Font settings are read at startup from `$XDG_CONFIG_HOME/vertex/config`, or
-`~/.config/vertex/config` when XDG_CONFIG_HOME is unset or relative. For example,
-to match Kitty with JetBrainsMonoNL Nerd Font at 13 points:
+Vertex reads TOML from `$XDG_CONFIG_HOME/vertex/config.toml`, or
+`~/.config/vertex/config.toml` when XDG_CONFIG_HOME is unset or relative. For example:
 
-```ini
-font_family = JetBrainsMonoNL Nerd Font
-font_size = 13
+```toml
+[font]
+family = "JetBrainsMono Nerd Font"
+size = 13
+ligatures = false
+
+[window]
+opacity = 0.9
+dynamic_padding = true
+[window.padding]
+left = 12
+right = 12
+top = 10
+bottom = 10
 ```
 
-See [the example config](assets/font-config.example). Font families may also be
-Fontconfig patterns. Size accepts fractional values from 4 to 128 points, at 96
-logical DPI. An absent config uses `monospace` at 12 points (16 logical pixels).
-Malformed settings produce a startup diagnostic. Restart Vertex after changes.
+Optional ligatures are disabled by default. Set `font.ligatures = true` with a
+ligature-capable font to enable them. Required script shaping, combining marks,
+and emoji remain available in either mode. Fonts, themes, spacing, padding,
+opacity, cursor styling, input bindings and titles reload automatically after
+valid edits. Invalid edits keep the active configuration and running shell.
+
+Run `vertex config defaults` for the complete annotated configuration,
+`vertex config check` to validate without opening a window, or
+`vertex --config ./rice.toml` to select another file. See the
+[configuration reference](docs/configuration.md), [example TOML](assets/config.example.toml),
+[themes](assets/themes), and [Hyprland/Niri examples](assets/compositors).
+The old `vertex/config` font-only file is no longer read; move `font_family` and
+`font_size` into `[font]` as `family` and `size` with quoted font names.
+An absent config uses monospace at 12 points; size accepts 4–128 points at 96 DPI.
 
 `VERTEX_FONT` and `VERTEX_FONT_SIZE` override individual config settings:
 
@@ -196,10 +218,11 @@ shows parser-to-screen integration and supported controls.
 ## MVP limits
 
 The terminal targets basic shell work, including command editing, history,
-completion, Ctrl shortcuts, and output scrolling. It starts at 80×24 cells unless
-the compositor assigns another size. Font family and point size are configured at startup
-through the config file or environment overrides. Resizing preserves the top-left overlap without reflow and
-notifies the PTY. There are no client-side decorations; use compositor shortcuts
+completion, Ctrl shortcuts, and output scrolling. It defaults to 80×24 cells unless
+the compositor assigns another size; configuration can change the initial dimensions.
+Appearance and input settings are configurable through TOML with live reload. Resizing preserves the top-left overlap without reflow and
+notifies the PTY. Server decorations can be requested when the compositor supports them.
+There are no client-side decorations; use compositor shortcuts
 for moving, resizing, and closing the window.
 
 Unicode 15.1 extended graphemes retain combining marks and emoji sequences in
@@ -242,7 +265,7 @@ not advertised.
 
 Scrollback history, selection/copy UI, image animation, fractional-scale protocols, and
 full xterm compatibility remain future work. Resizing preserves the top-left
-intersection without reflow. Blink is rendered steadily. Color-font SVG and
+intersection without reflow. Cursor blinking is configurable and applications can request it. Text blink is rendered steadily. Color-font SVG and
 COLRv1 painting are not supported.
 
 ## Structure
@@ -290,3 +313,4 @@ See [the architecture notes](docs/architecture.md) for integration details.
 
 Vertex uses the [MIT license](LICENSE). The parser has no external dependencies.
 GUI image decoding includes [stb_image under its MIT license](vendor/stb/LICENSE).
+GUI configuration uses the vendored [MIT-licensed tomlc17 parser](vendor/tomlc17/LICENSE).

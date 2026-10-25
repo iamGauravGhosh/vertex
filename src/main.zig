@@ -10,9 +10,18 @@ pub fn main(init: std.process.Init) u8 {
 
 fn run(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const platform = if (@import("builtin").is_test) @import("platform/disabled.zig") else @import("platform/root.zig");
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "config") and std.mem.eql(u8, args[2], "check")) {
+        const path: ?[]const u8 = if (args.len == 3) null else if (args.len == 5 and std.mem.eql(u8, args[3], "--config")) args[4] else return error.InvalidArguments;
+        try platform.checkConfig(init.gpa, path);
+        return 0;
+    }
     if (cli.opensWindow(args[1..])) {
-        const platform = if (@import("builtin").is_test) @import("platform/disabled.zig") else @import("platform/root.zig");
-        return platform.run(init.arena.allocator(), if (args.len > 1) args[2..] else &.{});
+        const options = cli.launch(args[1..]) catch {
+            std.debug.print("vertex: invalid arguments; use --help\n", .{});
+            return 2;
+        };
+        return platform.runWithOptions(init.gpa, options);
     }
     var input_buffer: [4096]u8 = undefined;
     var output_buffer: [4096]u8 = undefined;

@@ -32,9 +32,9 @@ pub fn build(b: *std.Build) void {
         const code_cmd = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
         code_cmd.addFileArg(xml);
         const code = code_cmd.addOutputFileArg("xdg-shell-protocol.c");
-        var extra_headers: [2]std.Build.LazyPath = undefined;
-        var extra_codes: [2]std.Build.LazyPath = undefined;
-        for ([_][]const u8{ "primary-selection", "text-input" }, [_][]const u8{ "unstable/primary-selection/primary-selection-unstable-v1.xml", "unstable/text-input/text-input-unstable-v3.xml" }, 0..) |name, path, i| {
+        var extra_headers: [5]std.Build.LazyPath = undefined;
+        var extra_codes: [5]std.Build.LazyPath = undefined;
+        for ([_][]const u8{ "primary-selection", "text-input", "xdg-decoration", "cursor-shape", "tablet" }, [_][]const u8{ "unstable/primary-selection/primary-selection-unstable-v1.xml", "unstable/text-input/text-input-unstable-v3.xml", "unstable/xdg-decoration/xdg-decoration-unstable-v1.xml", "staging/cursor-shape/cursor-shape-v1.xml", "unstable/tablet/tablet-unstable-v2.xml" }, 0..) |name, path, i| {
             const protocol_xml: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ protocols, path }) };
             const header_generator = b.addSystemCommand(&.{ "wayland-scanner", "client-header" });
             header_generator.addFileArg(protocol_xml);
@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         bindings.addIncludePath(header.dirname());
+        bindings.addIncludePath(b.path("vendor/tomlc17"));
         for (extra_headers) |extra| bindings.addIncludePath(extra.dirname());
         bindings.linkSystemLibrary("freetype2", .{});
         bindings.linkSystemLibrary("fontconfig", .{});
@@ -91,7 +92,13 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
     b.installFile("LICENSE", "share/licenses/vertex/LICENSE");
-    if (gui) b.installFile("vendor/stb/LICENSE", "share/licenses/vertex/stb_image-LICENSE");
+    if (gui) {
+        b.installFile("vendor/stb/LICENSE", "share/licenses/vertex/stb_image-LICENSE");
+        b.installFile("vendor/tomlc17/LICENSE", "share/licenses/vertex/tomlc17-LICENSE");
+        b.installFile("src/config_defaults.toml", "share/vertex/config.example.toml");
+        b.installDirectory(.{ .source_dir = b.path("assets"), .install_dir = .prefix, .install_subdir = "share/vertex/assets" });
+        b.installDirectory(.{ .source_dir = b.path("docs"), .install_dir = .prefix, .install_subdir = "share/vertex/docs" });
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.addPassthruArgs();
@@ -125,5 +132,7 @@ fn configureLinux(module: *std.Build.Module, bindings: *std.Build.Module, protoc
         module.linkSystemLibrary(library, .{});
     }
     module.addCSourceFile(.{ .file = protocol });
+    module.addIncludePath(.{ .cwd_relative = "vendor/tomlc17" });
+    module.addCSourceFile(.{ .file = .{ .cwd_relative = "vendor/tomlc17/tomlc17.c" }, .flags = &.{"-std=c17"} });
     module.addCSourceFile(.{ .file = .{ .cwd_relative = "src/platform/image_decode.c" }, .flags = &.{"-std=c11"} });
 }

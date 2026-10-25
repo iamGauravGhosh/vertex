@@ -41,6 +41,9 @@ pub const Cursor = struct {
     column: usize = 0,
     visible: bool = true,
     shape: enum { block, underline, bar } = .block,
+    blinking: bool = false,
+    /// A host can change defaults without overwriting an application's choice.
+    configured: bool = true,
 };
 
 const Saved = struct {
@@ -68,6 +71,7 @@ row_generations: []u64,
 tab_stops: []bool,
 soft_wrapped: []bool,
 cursor: Cursor = .{},
+default_cursor: Cursor = .{},
 style: Style = .{},
 scroll_top: usize = 0,
 scroll_bottom: usize,
@@ -153,6 +157,7 @@ pub fn resized(self: *const Screen, rows: usize, columns: usize) !Screen {
     var replacement = try init(self.allocator, rows, columns);
     errdefer replacement.deinit();
     replacement.cursor = self.cursor;
+    replacement.default_cursor = self.default_cursor;
     replacement.saved = self.saved;
     replacement.style = self.style;
     const graphics = try self.graphics.clone();
@@ -204,7 +209,7 @@ pub fn reset(self: *Screen) void {
     self.format_pending.clearRetainingCapacity();
     self.failure = null;
     self.invalidateAll();
-    self.cursor = .{};
+    self.cursor = self.default_cursor;
     self.style = .{};
     self.scroll_top = 0;
     self.scroll_bottom = self.rows;
@@ -534,11 +539,16 @@ fn csi(self: *Screen, command: Parser.Sequence) void {
     const p = command.parameters;
     if (std.mem.eql(u8, command.intermediates, " ") and command.final == 'q' and command.private_prefix == null) {
         const shape = parameter(p, 0, 0);
-        if (p.len <= 1 and shape <= 6) self.cursor.shape = switch (shape) {
-            3, 4 => .underline,
-            5, 6 => .bar,
-            else => .block,
-        };
+        if (p.len <= 1 and shape <= 6) {
+            self.cursor.shape = switch (shape) {
+                0 => self.default_cursor.shape,
+                3, 4 => .underline,
+                5, 6 => .bar,
+                else => .block,
+            };
+            self.cursor.blinking = if (shape == 0) self.default_cursor.blinking else shape % 2 == 1;
+            self.cursor.configured = shape == 0;
+        }
         return;
     }
     if (command.intermediates.len != 0) return;

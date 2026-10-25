@@ -33,6 +33,8 @@ pub const Modes = struct {
     mouse_tracking: u16 = 0,
     mouse_sgr: bool = false,
     mouse_pixels: bool = false,
+    /// Hosts with configurable local modifiers can handle bypass themselves.
+    mouse_shift_bypass: bool = true,
     focus: bool = false,
 };
 
@@ -204,7 +206,7 @@ pub const Pointer = struct {
 };
 pub fn encodePointer(buffer: []u8, event: Pointer, modes: Modes) ![]const u8 {
     const tracking = modes.mouse_tracking;
-    if (tracking == 0 or event.modifiers.shift) return buffer[0..0];
+    if (tracking == 0 or (modes.mouse_shift_bypass and event.modifiers.shift)) return buffer[0..0];
     if (tracking == 9 and event.kind != .press) return buffer[0..0];
     if (event.kind == .motion and (tracking == 9 or tracking == 1000 or (tracking == 1002 and event.button == 3))) return buffer[0..0];
     var button: u16 = event.button;

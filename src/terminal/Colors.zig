@@ -6,6 +6,26 @@ pub const palette = [_]u32{
     0x4c566a, 0xd08770, 0xb5d99c, 0xffdf9e, 0x81a1c1, 0xc6a0c9, 0x9dd9e5, 0xffffff,
 };
 
+/// A session's theme. Kept independent of files, the environment and painters.
+pub const Theme = struct {
+    foreground: u32 = foreground_default,
+    background: u32 = background_default,
+    normal: [8]u32 = palette[0..8].*,
+    bright: [8]u32 = palette[8..16].*,
+    indexed: [256]?u32 = @splat(null),
+    cursor: ?u32 = null,
+    cursor_text: ?u32 = null,
+    dim_factor: f64 = 0.5,
+    bold_is_bright: bool = false,
+
+    pub fn at(self: *const Theme, index: u8) u32 {
+        return self.indexed[index] orelse if (index < 8) self.normal[index] else if (index < 16) self.bright[index - 8] else Colors.indexed(index);
+    }
+};
+const Colors = @This();
+const foreground_default = foreground;
+const background_default = background;
+
 pub fn indexed(index: u8) u32 {
     if (index < 16) return palette[index];
     if (index >= 232) {

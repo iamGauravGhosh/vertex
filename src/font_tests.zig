@@ -194,3 +194,154 @@ fn writeAll(fd: c_int, bytes: []const u8) !void {
         offset += @intCast(n);
     }
 }
+
+test "ligatures default off toggle invalidates rows and preserves graphemes" {
+    var renderer = try Renderer.initWithOptions(t.allocator, .{ .family = "Vertex Test Proportional", .directory = "tests/fonts", .features = &.{"liga=1"} });
+    defer renderer.deinit();
+    var screen = try vt.Screen.init(t.allocator, 1, 6);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("iiA\u{301}界", &screen);
+    const separate = try renderer.shapeRow(&screen, 0);
+    try t.expectEqual(@as(usize, 1), separate[0].end);
+    try t.expectEqual(@as(usize, 2), separate[1].end);
+    const before = renderer.shaped_rows;
+    renderer.setLigatures(true);
+    const combined = try renderer.shapeRow(&screen, 0);
+    try t.expectEqual(@as(usize, 2), combined[0].end);
+    try t.expectEqual(before + 1, renderer.shaped_rows);
+    renderer.setLigatures(false);
+    try t.expectEqual(@as(usize, 1), (try renderer.shapeRow(&screen, 0))[0].end);
+    try t.expectEqual(@as(usize, 2), screen.getGrapheme(0, 2).?.len);
+    try t.expectEqual(@as(u2, 2), screen.getCell(0, 3).?.width);
+}
+
+test "alpha themes padding and incremental rendering agree between CPU and GPU" {
+    var renderer = try Renderer.initFontDirectory(t.allocator, "Vertex Test Proportional", "tests/fonts");
+    defer renderer.deinit();
+    renderer.theme.foreground = 0xf08040;
+    renderer.theme.background = 0x204060;
+    renderer.theme.normal[1] = 0x40e080;
+    renderer.origin_x = 7;
+    renderer.origin_y = 11;
+    var screen = try vt.Screen.init(t.allocator, 3, 12);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("\x1b[?25lAi\u{301}\x1b[31mWO\r\n\x1b[44m  \x1b[0m", &screen);
+    const width = 12 * renderer.cell_width + 19;
+    const height = 3 * renderer.cell_height + 23;
+    const pixels = try t.allocator.alloc(u32, width * height);
+    defer t.allocator.free(pixels);
+    const expected = try t.allocator.alloc(u32, pixels.len);
+    defer t.allocator.free(expected);
+    var gpu = Gpu.initHeadless(t.allocator, width, height) catch |err| {
+        if (c.getenv("VERTEX_TEST_GPU") != null) return err;
+        return error.SkipZigTest;
+    };
+    defer gpu.deinit();
+    const rgba = try t.allocator.alloc(u8, pixels.len * 4);
+    defer t.allocator.free(rgba);
+    var damage = Renderer.Damage.init(t.allocator);
+    defer damage.deinit();
+    damage.origin_y = renderer.origin_y;
+    for ([_]f64{ 1, 0.5, 0, 0.75 }) |opacity| {
+        renderer.background_opacity = opacity;
+        damage.invalidate();
+        for ([_][]const u8{ "", "\x1b[1;2HW", "\x1b[2;3Hi" }) |edit| {
+            parser.feed(edit, &screen);
+            _ = try damage.prepare(&screen, width, height, renderer.cell_height);
+            if (damage.full) @memset(pixels, renderer.background());
+            try renderer.drawRows(&screen, pixels, width, height, damage.rows);
+            try renderer.draw(&screen, expected, width, height);
+            try t.expectEqualSlices(u32, expected, pixels);
+            try t.expectEqual(renderer.background(), pixels[0]);
+            try t.expectEqual(renderer.background(), pixels[pixels.len - 1]);
+            try gpu.render(&renderer, &screen, &damage);
+            try gpu.readPixels(rgba);
+            for (0..height) |y| for (0..width) |x| {
+                const source = (height - 1 - y) * width * 4 + x * 4;
+                const argb = pixels[y * width + x];
+                for ([_]u5{ 16, 8, 0, 24 }, 0..) |shift, channel| {
+                    const wanted: i32 = @intCast((argb >> shift) & 255);
+                    try t.expect(@abs(wanted - @as(i32, rgba[source + channel])) <= 1);
+                }
+            };
+            damage.commit(&screen);
+        }
+    }
+}
+
+test "programming contextual ligatures obey the toggle while Arabic required shaping survives" {
+    var renderer = try Renderer.initFontDirectory(t.allocator, "Vertex Test Proportional", "tests/fonts");
+    defer renderer.deinit();
+    var screen = try vt.Screen.init(t.allocator, 1, 2);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("WW", &screen);
+    try t.expectEqual(@as(usize, 1), (try renderer.shapeRow(&screen, 0))[0].end);
+    renderer.setLigatures(true);
+    try t.expectEqual(@as(usize, 2), (try renderer.shapeRow(&screen, 0))[0].end);
+    var arabic = try Renderer.initFont(t.allocator, "DejaVu Sans");
+    defer arabic.deinit();
+    arabic.bidi = true;
+    screen.reset();
+    parser.feed("لا", &screen);
+    const required = try arabic.shapeRow(&screen, 0);
+    try t.expectEqual(@as(usize, 2), required[0].end);
+    const id = required[0].id;
+    arabic.setLigatures(true);
+    const enabled = try arabic.shapeRow(&screen, 0);
+    try t.expectEqual(@as(usize, 2), enabled[0].end);
+    try t.expectEqual(id, enabled[0].id);
+}
+
+test "explicit style families override the regular font's style fallback" {
+    var renderer = try Renderer.initWithOptions(t.allocator, .{
+        .family = "Vertex Test Mono",
+        .bold_family = "Vertex Test Styled",
+        .italic_family = "Vertex Test Styled",
+        .bold_italic_family = "Vertex Test Styled",
+        .directory = "tests/fonts",
+    });
+    defer renderer.deinit();
+    var screen = try vt.Screen.init(t.allocator, 1, 3);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("\x1b[1mA\x1b[22;3mA\x1b[1mA", &screen);
+    for (try renderer.shapeRow(&screen, 0)) |glyph| {
+        try t.expect(glyph.face != 0);
+        try t.expectEqualStrings("Vertex Test Styled", std.mem.span(renderer.faces.items[glyph.face - 1].face.*.family_name));
+    }
+}
+
+test "replacing fonts invalidates retained GPU atlas textures" {
+    var renderer = try Renderer.initFontDirectory(t.allocator, "Vertex Test Styled", "tests/fonts");
+    defer renderer.deinit();
+    var screen = try vt.Screen.init(t.allocator, 1, 4);
+    defer screen.deinit();
+    var parser = vt.Parser.init();
+    parser.feed("AA\x1b[?25l", &screen);
+    const width = renderer.cell_width * 4 + 20;
+    const height = renderer.cell_height + 20;
+    var gpu = Gpu.initHeadless(t.allocator, width, height) catch |err| {
+        if (c.getenv("VERTEX_TEST_GPU") != null) return err;
+        return error.SkipZigTest;
+    };
+    defer gpu.deinit();
+    var damage = Renderer.Damage.init(t.allocator);
+    defer damage.deinit();
+    _ = try damage.prepare(&screen, width, height, renderer.cell_height);
+    try gpu.render(&renderer, &screen, &damage);
+    const replacement = try Renderer.initFontDirectory(t.allocator, "Vertex Test Proportional", "tests/fonts");
+    renderer.deinit();
+    renderer = replacement;
+    // Populate the new atlas on CPU first: page revision numbers can coincide.
+    const pixels = try t.allocator.alloc(u32, width * height);
+    defer t.allocator.free(pixels);
+    try renderer.draw(&screen, pixels, width, height);
+    gpu.invalidateAtlas();
+    damage.invalidate();
+    _ = try damage.prepare(&screen, width, height, renderer.cell_height);
+    try gpu.render(&renderer, &screen, &damage);
+    try expectGpuPixels(&gpu, pixels);
+}
